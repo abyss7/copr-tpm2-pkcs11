@@ -1,0 +1,53 @@
+#!/bin/bash
+# Print the packages whose build in COPR is missing or differs from what
+# scripts/build-rpm.sh would build now: the latest Fedora version of the package
+# plus our release suffix (which changes with the patches).
+#
+# Must run inside Fedora of the release to check (natively, or via scripts/enter.sh).
+#
+# usage: copr-outdated [-p owner/project] [-c chroot] [-v] [<package>...]
+#   default project: $COPR_PROJECT or abyss/tpm2-pkcs11
+#   default chroot: fedora-<this release>-<arch>
+#   default packages: all directories in patches/
+#   -v: print the compared versions to stderr
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/scripts/lib.sh"
+
+project=${COPR_PROJECT:-abyss/tpm2-pkcs11}
+chroot=fedora-$(rpm -E '%fedora')-$(uname -m)
+verbose=""
+while getopts p:c:v o; do
+	case $o in
+	p) project=$OPTARG ;;
+	c) chroot=$OPTARG ;;
+	v) verbose=1 ;;
+	*) exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+pkgs=("$@")
+if [ ${#pkgs[@]} = 0 ]; then
+	for d in "$ROOT"/patches/*/; do pkgs+=("$(basename "$d")"); done
+fi
+
+repo=https://download.copr.fedorainfracloud.org/results/$project/$chroot/
+# Fedora repositories of this system, without our COPR repository if it is enabled
+fedora_repos=$(dnf -q repo list --enabled 2>/dev/null | awk 'NR > 1 && $1 !~ /^copr:/ { printf "--repo=%s ", $1 }')
+
+evr() {
+	# the source package name is also a binary package name for everything in patches/
+	dnf -q repoquery --latest-limit 1 --arch "$(uname -m),noarch" --qf '%{evr}\n' "$@" 2>/dev/null | tail -1
+}
+
+for pkg in "${pkgs[@]}"; do
+	# shellcheck disable=SC2086
+	fedora=$(evr $fedora_repos "$pkg")
+	[ -n "$fedora" ] || { echo "$pkg: not found in the Fedora repositories" >&2; exit 1; }
+	want=$fedora.$(release_suffix "$ROOT" "$pkg")
+	have=$(evr --repofrompath="copr-check,$repo" --repo=copr-check --setopt=copr-check.gpgcheck=0 "$pkg")
+	[ -z "$verbose" ] || echo "$pkg: fedora $fedora, want $want, copr ${have:-none}" >&2
+	[ "$have" = "$want" ] || echo "$pkg"
+done

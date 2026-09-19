@@ -2,3 +2,4 @@
 /out/
 /src/
 /.clangd_env
+__pycache__/

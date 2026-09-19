@@ -1,0 +1,119 @@
+name: COPR
+
+# Keep the COPR repository in sync with Fedora: rebuild a package when Fedora
+# updates it or when its patches change. Releases are the chroots enabled in
+# the COPR project, so enabling a new Fedora release there is enough.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/build-rpm.sh"
+      - "scripts/lib.sh"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild all packages even if COPR is up to date"
+        type: boolean
+        default: false
+
+concurrency:
+  group: copr
+  cancel-in-progress: false
+
+env:
+  COPR_PROJECT: abyss/tpm2-pkcs11
+
+jobs:
+  chroots:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.chroots.outputs.matrix }}
+    steps:
+      - name: Check the COPR token
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "::error::Secret COPR_CONFIG is not set (contents of ~/.config/copr)"
+            exit 1
+          fi
+          exp=$(printf '%s\n' "$COPR_CONFIG" | sed -n 's/^# expiration date: *//p')
+          if [ -n "$exp" ]; then
+            left=$(( ($(date -d "$exp" +%s) - $(date +%s)) / 86400 ))
+            if [ "$left" -lt 0 ]; then
+              echo "::error::The COPR token expired on $exp, renew it at https://copr.fedorainfracloud.org/api/ and update the COPR_CONFIG secret"
+              exit 1
+            elif [ "$left" -lt 21 ]; then
+              echo "::warning::The COPR token expires in $left days ($exp), renew it at https://copr.fedorainfracloud.org/api/"
+            fi
+          fi
+
+      - name: List Fedora chroots of the project
+        id: chroots
+        run: |
+          owner=${COPR_PROJECT%/*} project=${COPR_PROJECT#*/}
+          curl -fsS "https://copr.fedorainfracloud.org/api_3/project?ownername=$owner&projectname=$project" |
+          python3 -c '
+          import json, re, sys
+          chroots = json.load(sys.stdin)["chroot_repos"]
+          include = []
+          for c in sorted(chroots):
+              m = re.fullmatch(r"fedora-(\d+|rawhide)-x86_64", c)
+              if m:
+                  include.append({"chroot": c, "image": m.group(1)})
+          print("matrix=" + json.dumps({"include": include}))
+          ' >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  publish:
+    name: ${{ matrix.chroot }}
+    needs: chroots
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.chroots.outputs.matrix) }}
+    steps:
+      - name: Install tools
+        run: |
+          dnf config-manager setopt fedora-cisco-openh264.enabled=0 || true
+          dnf -y -q --setopt=install_weak_deps=0 install git-core rpm-build dnf5-plugins copr-cli
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Find outdated packages
+        id: outdated
+        run: |
+          if [ "${{ inputs.force }}" = true ]; then
+            pkgs=$(ls patches)
+          else
+            pkgs=$(scripts/copr-outdated -v -c "${{ matrix.chroot }}")
+          fi
+          echo "packages: ${pkgs:-none}"
+          echo "packages=$(echo $pkgs)" >> "$GITHUB_OUTPUT"
+
+      - name: Build SRPMs
+        if: steps.outdated.outputs.packages != ''
+        run: SRPM_ONLY=1 scripts/build-rpm.sh ${{ steps.outdated.outputs.packages }}
+
+      - name: Build in COPR
+        if: steps.outdated.outputs.packages != ''
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          for srpm in out/*/srpm/*.src.rpm; do
+            echo "::group::${srpm##*/}"
+            copr-cli build -r "${{ matrix.chroot }}" "$COPR_PROJECT" "$srpm"
+            echo "::endgroup::"
+          done

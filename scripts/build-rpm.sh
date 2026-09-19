@@ -3,19 +3,19 @@
 #
 # Must run inside Fedora (natively, or in a rootfs via scripts/rebuild).
 # For every package: downloads the latest SRPM from the enabled repos, adds
-# patches/<package>/*.patch as Patch9000+, appends ".$SUFFIX" to Release,
+# patches/<package>/*.patch as Patch9000+, appends ".pkcs11.<N>" to Release (see lib.sh),
 # installs build deps, builds, and puts binary RPMs into out/fc<N>/ (a dnf repo).
 #
 # usage: build-rpm.sh <package> [<package>...]
 # patches/<package>/spec.sh, if present, is sourced with $spec set to tweak the spec.
 #
-#   env: SUFFIX (default: pkcs11), SRPM_<package> (use given SRPM instead of downloading),
+#   env: SUFFIX (override the release suffix), SRPM_<package> (use given SRPM instead of downloading),
 #        SUDO (default: "sudo" unless running as root),
 #        SRPM_ONLY=1 (only build the patched SRPMs into out/fc<N>/srpm/, e.g. for COPR)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SUFFIX=${SUFFIX:-pkcs11}
+. "$ROOT/scripts/lib.sh"
 DIST=$(rpm -E 'fc%fedora')
 OUT=$ROOT/out/$DIST
 if [ -z "${SUDO+x}" ]; then
@@ -26,6 +26,7 @@ mkdir -p "$OUT"
 
 for pkg in "$@"; do
 	patchdir=$ROOT/patches/$pkg
+	suffix=${SUFFIX:-$(release_suffix "$ROOT" "$pkg")}
 	[ -d "$patchdir" ] || { echo "no patches dir: $patchdir" >&2; exit 1; }
 
 	work=$(mktemp -d "${TMPDIR:-/var/tmp}/build-$pkg.XXXXXX")
@@ -66,8 +67,8 @@ for pkg in "$@"; do
 		. "$patchdir/spec.sh"
 	fi
 
-	sed -i -E "s/^(Release:\s*.*%\{\?dist\})\s*$/\1.$SUFFIX/" "$spec"
-	grep -qE "^Release:.*\.$SUFFIX$" "$spec" || { echo "$spec: failed to patch Release" >&2; exit 1; }
+	sed -i -E "s/^(Release:\s*.*%\{\?dist\})\s*$/\1.$suffix/" "$spec"
+	grep -qF ".$suffix" <(grep '^Release:' "$spec") || { echo "$spec: failed to patch Release" >&2; exit 1; }
 
 	if [ -n "${SRPM_ONLY:-}" ]; then
 		mkdir -p "$OUT/srpm"

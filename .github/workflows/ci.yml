@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Fedora ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:${{ matrix.release }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["43", "44"]
+    steps:
+      - name: Install tools
+        run: |
+          dnf config-manager setopt fedora-cisco-openh264.enabled=0 || true
+          dnf -y -q --setopt=install_weak_deps=0 install \
+            git-core rpm-build dnf5-plugins createrepo_c python3 \
+            openvpn softhsm opensc openssl cmake gcc-c++ make
+
+      - uses: actions/checkout@v4
+        with:
+          # the release suffix counts the commits that changed the patches
+          fetch-depth: 0
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build RPMs
+        run: scripts/rebuild
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-fc${{ matrix.release }}
+          path: out/fc${{ matrix.release }}/*.rpm
+
+      - name: Test connection migration
+        run: python3 tests/test_migrate.py
+
+      - name: Test openvpn with a SoftHSM token
+        run: python3 tests/softhsm-openvpn.py
+
+      - name: Test the plasma-nm OpenVPN plugin UI
+        run: |
+          scripts/setup-src --shallow plasma-nm
+          tests/plasma-nm-openvpn-ui.sh

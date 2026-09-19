@@ -1,0 +1,39 @@
+#!/bin/bash
+# Recreate src/<package> as an upstream clone with the "pkcs11" branch made of
+# patches/<package>/*.patch on top of patches/<package>/BASE.
+#
+# usage: scripts/setup-src [--shallow] [<package>...]
+#   --shallow: clone only the BASE tag (enough to build and test, e.g. in CI)
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+declare -A UPSTREAM=(
+	[NetworkManager-openvpn]=https://gitlab.gnome.org/GNOME/NetworkManager-openvpn.git
+	[plasma-nm]=https://invent.kde.org/plasma/plasma-nm.git
+)
+
+shallow=""
+[ "${1:-}" = --shallow ] && { shallow=1; shift; }
+pkgs=("$@")
+if [ ${#pkgs[@]} = 0 ]; then
+	for d in "$ROOT"/patches/*/; do pkgs+=("$(basename "$d")"); done
+fi
+
+for pkg in "${pkgs[@]}"; do
+	dir=$ROOT/src/$pkg
+	base=$(cat "$ROOT/patches/$pkg/BASE")
+	if [ ! -d "$dir/.git" ]; then
+		if [ -n "$shallow" ]; then
+			git clone -q --depth 1 --branch "$base" "${UPSTREAM[$pkg]}" "$dir"
+		else
+			git clone -q "${UPSTREAM[$pkg]}" "$dir"
+		fi
+	fi
+	if git -C "$dir" rev-parse -q --verify pkcs11 > /dev/null; then
+		echo "== $pkg: branch pkcs11 already exists, left as is"
+		continue
+	fi
+	git -C "$dir" checkout -q -b pkcs11 "$base"
+	git -C "$dir" -c user.name=setup-src -c user.email=setup-src@localhost am -q "$ROOT/patches/$pkg/"*.patch
+	echo "== $pkg: pkcs11 = $base + $(ls "$ROOT/patches/$pkg/"*.patch | wc -l) patches"
+done

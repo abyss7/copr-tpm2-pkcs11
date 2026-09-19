@@ -1,15 +1,17 @@
 #!/bin/bash
 # Build plasma-nm's OpenVPN plugin from src/plasma-nm and run the headless UI test
-# against a SoftHSM token. Run inside the Fedora rootfs:
+# against a SoftHSM token. Needs Fedora with the plasma-nm build dependencies,
+# openvpn, softhsm and opensc, and src/plasma-nm (scripts/setup-src), e.g.:
 #   scripts/enter.sh .cache/f43 /work/tests/plasma-nm-openvpn-ui.sh
 set -euo pipefail
 
-B=/root/pnm-build
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+B=${BUILD_DIR:-$ROOT/.cache/plasma-nm-build}
 T=$(mktemp -d)
 export SOFTHSM2_CONF=$T/softhsm2.conf QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1
 
 mkdir -p $B
-cmake -S /work/src/plasma-nm -B $B -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON > $B/cmake.log
+cmake -S $ROOT/src/plasma-nm -B $B -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON > $B/cmake.log
 make -C $B -s -j"$(nproc)" plasmanetworkmanagement_openvpnui
 
 # compile the test with the flags of a plugin source file
@@ -28,7 +30,7 @@ for e in json.load(open(sys.argv[1] + "/compile_commands.json")):
 EOF
 )
 libs="$(pkg-config --cflags --libs Qt6Widgets Qt6Test Qt6DBus libnm)"
-eval g++ $flags -I/work/src/plasma-nm/libs/editor/widgets -o $T/uitest /work/tests/plasma-nm-openvpn-ui.cpp \
+eval g++ $flags -I$ROOT/src/plasma-nm/libs/editor/widgets -o $T/uitest $ROOT/tests/plasma-nm-openvpn-ui.cpp \
 	-L$B/bin -Wl,-rpath,$B/bin -lplasmanm_editor -lKF6CoreAddons -lKF6NetworkManagerQt $libs
 
 # token with a certificate
