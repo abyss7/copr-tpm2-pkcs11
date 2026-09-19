@@ -1,0 +1,115 @@
+#!/usr/bin/python3
+"""Convert OpenVPN connections made with the old local PKCS#11 patch
+(connection-type tls-pkcs11, pkcs11-providers, pkcs11-pin) to the format of
+NetworkManager-openvpn!108 (connection-type pkcs11, PIN in cert-pass).
+
+The new plugin rejects the old keys, so such connections fail to start.
+
+usage: migrate-legacy-connection [--apply] [<connection id or uuid>...]
+  Without --apply only shows what would change. Without connection names
+  handles every OpenVPN connection that needs it.
+"""
+import sys
+
+OLD_TYPES = {"tls-pkcs11": "pkcs11", "password-tls-pkcs11": "pkcs11"}
+DROP_DATA = ("pkcs11-providers",)
+
+
+def migrate(data, secrets):
+    """Return (new_data, new_secrets, notes) or None when nothing to do."""
+    if data.get("connection-type") not in OLD_TYPES and not any(k in data for k in DROP_DATA) \
+            and "pkcs11-pin" not in secrets and "pkcs11-pin-flags" not in data:
+        return None
+    data = dict(data)
+    secrets = dict(secrets)
+    notes = []
+    old = data.get("connection-type")
+    if old in OLD_TYPES:
+        data["connection-type"] = OLD_TYPES[old]
+        if old == "password-tls-pkcs11":
+            notes.append("username/password authentication is not supported together with PKCS#11 "
+                         "by the new plugin, the username is dropped")
+            for k in ("username", "password-flags"):
+                data.pop(k, None)
+            secrets.pop("password", None)
+    for k in DROP_DATA:
+        if data.pop(k, None) is not None:
+            notes.append(f"'{k}' removed: all modules registered in p11-kit are used now")
+    # certificate and key are on the token
+    for k in ("cert", "key"):
+        if data.pop(k, None) is not None:
+            notes.append(f"'{k}' removed: the certificate is taken from the token")
+    if "pkcs11-pin-flags" in data:
+        data["cert-pass-flags"] = data.pop("pkcs11-pin-flags")
+    if "pkcs11-pin" in secrets:
+        secrets["cert-pass"] = secrets.pop("pkcs11-pin")
+    if not data.get("pkcs11-id"):
+        notes.append("WARNING: no pkcs11-id, choose the certificate in the connection editor (Detect)")
+    return data, secrets, notes
+
+
+def main(argv):
+    import gi
+    gi.require_version("NM", "1.0")
+    from gi.repository import NM, GLib
+
+    apply = "--apply" in argv
+    names = [a for a in argv if a != "--apply"]
+    client = NM.Client.new(None)
+    loop = GLib.MainLoop()
+    rc = 0
+    for con in client.get_connections():
+        s_vpn = con.get_setting_vpn()
+        if not s_vpn or s_vpn.get_service_type() != "org.freedesktop.NetworkManager.openvpn":
+            continue
+        if names and con.get_id() not in names and con.get_uuid() not in names:
+            continue
+        data = {k: s_vpn.get_data_item(k) for k in s_vpn.get_data_keys() or []}
+        try:
+            # system-wide stored secrets; agent-owned ones (KWallet) are not visible here
+            secrets_v = con.get_secrets(NM.SETTING_VPN_SETTING_NAME, None)
+            vs = secrets_v.unpack().get("vpn", {}).get("secrets", {}) if secrets_v else {}
+        except GLib.Error:
+            vs = {}
+        res = migrate(data, vs)
+        if res is None:
+            continue
+        new_data, new_secrets, notes = res
+        print(f"== {con.get_id()} ({con.get_uuid()})")
+        for k in sorted(set(data) | set(new_data)):
+            if data.get(k) != new_data.get(k):
+                print(f"   data {k}: {data.get(k)!r} -> {new_data.get(k)!r}")
+        for k in sorted(set(vs) | set(new_secrets)):
+            if (k in vs) != (k in new_secrets):
+                print(f"   secret {k}: {'set' if k in vs else '-'} -> {'set' if k in new_secrets else '-'}")
+        for n in notes:
+            print(f"   note: {n}")
+        if not apply:
+            continue
+        for k in data:
+            s_vpn.remove_data_item(k)
+        for k, v in new_data.items():
+            s_vpn.add_data_item(k, v)
+        for k in list(s_vpn.get_secret_keys() or []):
+            s_vpn.remove_secret(k)
+        for k, v in new_secrets.items():
+            s_vpn.add_secret(k, v)
+
+        def done(c, result, _):
+            nonlocal rc
+            try:
+                c.commit_changes_finish(result)
+                print("   saved")
+            except GLib.Error as e:
+                print(f"   ERROR: {e.message}")
+                rc = 1
+            loop.quit()
+        con.commit_changes_async(True, None, done, None)
+        loop.run()
+    if not apply:
+        print("(dry run, use --apply to save)")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

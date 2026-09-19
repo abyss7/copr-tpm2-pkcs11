@@ -1,0 +1,34 @@
+#!/bin/bash
+# Install the rebuilt packages from out/fc<N>/ on this Fedora host and pin them
+# with dnf versionlock, so regular updates don't replace them.
+# Only subpackages that are already installed get installed (plus the main ones).
+#
+# usage: scripts/install [-n]    (-n: only show what would be done)
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+OUT=$ROOT/out/$(rpm -E 'fc%fedora')
+dry=""
+[ "${1:-}" = "-n" ] && dry=echo
+
+[ -d "$OUT" ] || { echo "nothing built in $OUT, run scripts/rebuild first" >&2; exit 1; }
+
+always="NetworkManager-openvpn plasma-nm plasma-nm-openvpn"
+rpms=()
+names=()
+for f in "$OUT"/*.rpm; do
+	case $f in *.src.rpm) continue ;; esac
+	n=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null)
+	if rpm -q "$n" > /dev/null 2>&1 || [[ " $always " == *" $n "* ]]; then
+		rpms+=("$f")
+		names+=("$n")
+	fi
+done
+[ ${#rpms[@]} -gt 0 ] || { echo "no packages to install" >&2; exit 1; }
+
+printf '== install:\n'; printf '   %s\n' "${rpms[@]##*/}"
+
+# drop our old locks (and the ones of the old local patch), then lock the new versions
+$dry sudo dnf versionlock delete "${names[@]}" > /dev/null 2>&1 || true
+$dry sudo dnf install -y "${rpms[@]}"
+$dry sudo dnf versionlock add "${names[@]}"

@@ -1,0 +1,25 @@
+#!/bin/bash
+# Regenerate patches/<package>/*.patch from the "pkcs11" branch of src/<package>.
+# CI files (absent from release tarballs) are left out.
+# The base is read from patches/<package>/BASE (an upstream tag, e.g. 1.12.5 or v6.7.5).
+#
+# usage: scripts/export-patches [<package>...]
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+pkgs=("$@")
+if [ ${#pkgs[@]} = 0 ]; then
+	for d in "$ROOT"/patches/*/; do pkgs+=("$(basename "$d")"); done
+fi
+for pkg in "${pkgs[@]}"; do
+	dir=$ROOT/patches/$pkg
+	base=$(cat "$dir/BASE")
+	rm -f "$dir"/*.patch
+	git -C "$ROOT/src/$pkg" format-patch -q --no-signature --zero-commit -N \
+		-o "$dir" "$base..pkcs11" -- . \
+		':(exclude).gitlab-ci.yml' ':(exclude).gitlab-ci' ':(exclude).github' ':(exclude).kde-ci.yml'
+	# commits touching only excluded files leave empty patches
+	for p in "$dir"/*.patch; do
+		grep -q '^diff --git' "$p" || rm "$p"
+	done
+	echo "== $pkg: $(ls "$dir"/*.patch 2>/dev/null | wc -l) patches on top of $base"
+done

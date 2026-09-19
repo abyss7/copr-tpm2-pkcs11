@@ -1,0 +1,56 @@
+#!/bin/bash
+# Rebuild patched packages for a Fedora release.
+#
+# usage: scripts/rebuild [-r <fedora-release>] [<package>...]
+#   default release: the host's one (on Fedora), otherwise 43
+#   default packages: all directories in patches/
+#
+# On Fedora for the host's release it builds natively (build deps via sudo dnf).
+# Otherwise it builds in an unprivileged Fedora rootfs in .cache/f<N>
+# (downloaded from quay.io/fedora/fedora on first use).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+host_rel=$(rpm -E '%fedora' 2>/dev/null || true)
+[[ "$host_rel" =~ ^[0-9]+$ ]] || host_rel=""
+rel=${host_rel:-43}
+
+while getopts r: o; do
+	case $o in
+	r) rel=$OPTARG ;;
+	*) exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+pkgs=("$@")
+if [ ${#pkgs[@]} = 0 ]; then
+	for d in "$ROOT"/patches/*/; do pkgs+=("$(basename "$d")"); done
+fi
+
+if [ "$rel" = "$host_rel" ] && [ -z "${FORCE_ROOTFS:-}" ]; then
+	exec "$ROOT/scripts/build-rpm.sh" "${pkgs[@]}"
+fi
+
+rootfs=$ROOT/.cache/f$rel
+if [ ! -d "$rootfs/usr" ]; then
+	echo "== fetching Fedora $rel rootfs"
+	python3 "$ROOT/scripts/fetch-rootfs.py" "$rel" "$rootfs"
+	"$ROOT/scripts/enter.sh" "$rootfs" dnf -y -q --setopt=install_weak_deps=0 \
+		install rpm-build dnf5-plugins createrepo_c git-core patch
+fi
+# openh264 mirror is flaky and nothing we build needs it
+"$ROOT/scripts/enter.sh" "$rootfs" bash -c \
+	'dnf config-manager setopt fedora-cisco-openh264.enabled=0 >/dev/null 2>&1 || true'
+# Fedora 44+ tar uses openat2(), which host kernels older than 5.6 lack
+# (ENOSYS, "Cannot open: Function not implemented"). Use bsdtar there.
+"$ROOT/scripts/enter.sh" "$rootfs" bash -c '
+cd /var/tmp && rm -rf tartest && mkdir -p tartest/d && echo x > tartest/d/f &&
+tar -C tartest -cf tartest.tar d && rm -r tartest/d &&
+if ! tar -C tartest -xf tartest.tar 2>/dev/null; then
+	echo "== tar is broken on this kernel, using bsdtar"
+	dnf -y -q install bsdtar >/dev/null
+	printf "#!/bin/sh\nexec bsdtar \"\$@\"\n" > /usr/bin/tar
+fi
+rm -rf tartest tartest.tar'
+exec "$ROOT/scripts/enter.sh" "$rootfs" /usr/bin/env ROOTFS=1 SRPM_ONLY="${SRPM_ONLY:-}" /work/scripts/build-rpm.sh "${pkgs[@]}"

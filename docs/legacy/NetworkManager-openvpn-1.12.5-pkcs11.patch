@@ -1,0 +1,1299 @@
+diff --color -ur NetworkManager-openvpn-1.12.0/auth-dialog/main.c NetworkManager-openvpn-1.12.0-new/auth-dialog/main.c
+--- NetworkManager-openvpn-1.12.0/auth-dialog/main.c	2024-06-20 17:45:32.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/auth-dialog/main.c	2024-09-07 22:26:11.521900896 +0300
+@@ -93,6 +93,9 @@
+                                  gboolean need_password,
+                                  const char *existing_password,
+                                  char **out_new_password,
++								 gboolean need_pin,
++								 const char *existing_pin,
++								 char **out_new_pin,
+                                  gboolean need_certpass,
+                                  const char *existing_certpass,
+                                  char **out_new_certpass,
+@@ -105,6 +108,8 @@
+                             gboolean allow_interaction,
+                             gboolean need_password,
+                             const char *password,
++							gboolean need_pin,
++							const char *pin,
+                             gboolean need_certpass,
+                             const char *certpass,
+                             gboolean need_proxypass,
+@@ -162,6 +167,8 @@
+             gboolean allow_interaction,
+             gboolean need_password,
+             const char *existing_password,
++			gboolean need_pin,
++			const char *existing_pin,
+             gboolean need_certpass,
+             const char *existing_certpass,
+             gboolean need_proxypass,
+@@ -189,6 +196,13 @@
+ 	                        need_password && allow_interaction);
+ 
+ 	keyfile_add_entry_info (keyfile,
++							NM_OPENVPN_KEY_PKCS11_PIN,
++							existing_pin ? existing_pin : "",
++							_("PIN"),
++							TRUE,
++							need_pin && allow_interaction);
++
++	keyfile_add_entry_info (keyfile,
+ 	                        NM_OPENVPN_KEY_CERTPASS,
+ 	                        existing_certpass ? existing_certpass : "",
+ 	                        _("Certificate password"),
+@@ -228,6 +242,9 @@
+               gboolean need_password,
+               const char *existing_password,
+               char **out_new_password,
++			  gboolean need_pin,
++			  const char *existing_pin,
++			  char **out_new_pin,
+               gboolean need_certpass,
+               const char *existing_certpass,
+               char **out_new_certpass,
+@@ -241,6 +258,7 @@
+ 	g_return_val_if_fail (vpn_name != NULL, FALSE);
+ 	g_return_val_if_fail (prompt != NULL, FALSE);
+ 	g_return_val_if_fail (out_new_password != NULL, FALSE);
++	g_return_val_if_fail (out_new_pin != NULL, FALSE);
+ 	g_return_val_if_fail (out_new_certpass != NULL, FALSE);
+ 	g_return_val_if_fail (out_new_proxypass != NULL, FALSE);
+ 
+@@ -253,10 +271,13 @@
+ 	if (need_password)
+ 		nma_vpn_password_dialog_set_password (dialog, existing_password);
+ 
+-	nma_vpn_password_dialog_set_show_password_secondary (dialog, need_certpass);
++	nma_vpn_password_dialog_set_show_password_secondary (dialog, need_certpass || need_pin);
+ 	if (need_certpass) {
+ 		nma_vpn_password_dialog_set_password_secondary_label (dialog, _("Certificate pass_word:") );
+ 		nma_vpn_password_dialog_set_password_secondary (dialog, existing_certpass);
++	} else if (need_pin) {
++		nma_vpn_password_dialog_set_password_secondary_label (dialog, _("PKCS#11 PIN:") );
++		nma_vpn_password_dialog_set_password_secondary (dialog, existing_pin);
+ 	}
+ 
+ 	nma_vpn_password_dialog_set_show_password_ternary (dialog, need_proxypass);
+@@ -269,6 +290,8 @@
+ 	if (nma_vpn_password_dialog_run_and_block (dialog)) {
+ 		if (need_password)
+ 			*out_new_password = g_strdup (nma_vpn_password_dialog_get_password (dialog));
++		if (need_pin)
++			*out_new_pin = g_strdup (nma_vpn_password_dialog_get_password_secondary (dialog));
+ 		if (need_certpass)
+ 			*out_new_certpass = g_strdup (nma_vpn_password_dialog_get_password_secondary (dialog));
+ 		if (need_proxypass)
+@@ -312,6 +335,8 @@
+             gboolean allow_interaction,
+             gboolean need_password,
+             const char *password,
++			gboolean need_pin,
++			const char *pin,
+             gboolean need_certpass,
+             const char *certpass,
+             gboolean need_proxypass,
+@@ -322,6 +347,8 @@
+ 	/* Send the passwords back to our parent */
+ 	if (password)
+ 		printf ("%s\n%s\n", NM_OPENVPN_KEY_PASSWORD, password);
++	if (pin)
++	    printf("%s\n%s\n", NM_OPENVPN_KEY_PKCS11_PIN, pin);
+ 	if (certpass)
+ 		printf ("%s\n%s\n", NM_OPENVPN_KEY_CERTPASS, certpass);
+ 	if (proxypass)
+@@ -342,9 +369,11 @@
+                         GHashTable *existing_secrets,
+                         const char *vpn_uuid,
+                         gboolean need_password,
++						gboolean need_pin,
+                         gboolean need_certpass,
+                         gboolean need_proxypass,
+                         char **out_password,
++						char **out_pin,
+                         char **out_certpass,
+                         char **out_proxypass)
+ {
+@@ -353,6 +382,7 @@
+ 	NMSettingSecretFlags proxy_flags = NM_SETTING_SECRET_FLAG_NONE;
+ 
+ 	g_return_if_fail (out_password != NULL);
++	g_return_if_fail (out_pin != NULL);
+ 	g_return_if_fail (out_certpass != NULL);
+ 	g_return_if_fail (out_proxypass != NULL);
+ 
+@@ -365,6 +395,15 @@
+ 		}
+ 	}
+ 
++	nm_vpn_service_plugin_get_secret_flags (vpn_data, NM_OPENVPN_KEY_PKCS11_PIN, &pw_flags);
++	if (need_pin) {
++		if (!(pw_flags & NM_SETTING_SECRET_FLAG_NOT_SAVED)) {
++			*out_pin = g_strdup (g_hash_table_lookup (existing_secrets, NM_OPENVPN_KEY_PKCS11_PIN));
++			if (!*out_pin)
++				*out_pin = keyring_lookup_secret (vpn_uuid, NM_OPENVPN_KEY_PKCS11_PIN);
++		}
++	}
++
+ 	nm_vpn_service_plugin_get_secret_flags (vpn_data, NM_OPENVPN_KEY_CERTPASS, &cp_flags);
+ 	if (need_certpass) {
+ 		if (!(cp_flags & NM_SETTING_SECRET_FLAG_NOT_SAVED)) {
+@@ -390,6 +429,7 @@
+ get_passwords_required (GHashTable *data,
+                         const char *const*hints,
+                         gboolean *out_need_password,
++						gboolean *out_need_pin,
+                         gboolean *out_need_certpass,
+                         gboolean *out_need_proxypass,
+                         gboolean *out_need_challengeresponse,
+@@ -401,6 +441,7 @@
+ 	const char *const*iter;
+ 
+ 	*out_need_password = FALSE;
++	*out_need_pin = FALSE;
+ 	*out_need_certpass = FALSE;
+ 	*out_need_proxypass = FALSE;
+ 	*out_need_challengeresponse = FALSE;
+@@ -430,11 +471,17 @@
+ 	ctype = g_hash_table_lookup (data, NM_OPENVPN_KEY_CONNECTION_TYPE);
+ 	g_return_val_if_fail (ctype != NULL, NULL);
+ 
+-	if (!strcmp (ctype, NM_OPENVPN_CONTYPE_TLS) || !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
++	if (!strcmp (ctype, NM_OPENVPN_CONTYPE_TLS)
++	    || !strcmp (ctype, NM_OPENVPN_CONTYPE_TLS_PKCS11)
++	    || !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++		|| !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)) {
++		/* PKCS11 PIN */
++		if (   !strcmp(ctype, NM_OPENVPN_CONTYPE_TLS_PKCS11) || !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
++		    *out_need_pin = TRUE;
+ 		/* Normal user password */
+ 		flags = NM_SETTING_SECRET_FLAG_NONE;
+ 		nm_vpn_service_plugin_get_secret_flags (data, NM_OPENVPN_KEY_PASSWORD, &flags);
+-		if (   !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++		if (   (!strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS) || !strcmp (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
+ 		    && !(flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED))
+ 			*out_need_password = TRUE;
+ 
+@@ -470,6 +517,7 @@
+ 	gs_unref_hashtable GHashTable *data = NULL;
+ 	gs_unref_hashtable GHashTable *secrets = NULL;
+ 	gboolean need_password = FALSE;
++	gboolean need_pin = FALSE;
+ 	gboolean need_certpass = FALSE;
+ 	gboolean need_proxypass = FALSE;
+ 	gboolean need_challengeresponse = FALSE;
+@@ -477,9 +525,11 @@
+ 	gs_strfreev char **hints = NULL;
+ 	gs_free char *prompt = NULL;
+ 	nm_auto_free_secret char *new_password = NULL;
++	nm_auto_free_secret char *new_pin = NULL;
+ 	nm_auto_free_secret char *new_certpass = NULL;
+ 	nm_auto_free_secret char *new_proxypass = NULL;
+ 	nm_auto_free_secret char *existing_password = NULL;
++	nm_auto_free_secret char *existing_pin = NULL;
+ 	nm_auto_free_secret char *existing_certpass = NULL;
+ 	nm_auto_free_secret char *existing_proxypass = NULL;
+ 	gboolean external_ui_mode = FALSE;
+@@ -539,14 +589,14 @@
+ 	/* Determine which passwords are actually required, either from hints or
+ 	 * from looking at the VPN configuration.
+ 	 */
+-	prompt = get_passwords_required (data, (const char *const *)hints, &need_password,
++	prompt = get_passwords_required (data, (const char *const *)hints, &need_password, &need_pin,
+ 	                                 &need_certpass, &need_proxypass, &need_challengeresponse,
+ 	                                 &need_challengeresponse_echo);
+ 	if (!prompt)
+ 		prompt = g_strdup_printf (_("You need to authenticate to access the Virtual Private Network “%s”."), vpn_name);
+ 
+ 	/* Exit early if we don't need any passwords */
+-	if (!need_password && !need_certpass && !need_proxypass && !need_challengeresponse) {
++	if (!need_password && !need_pin && !need_certpass && !need_proxypass && !need_challengeresponse) {
+ 		no_secrets_required_func ();
+ 		return EXIT_SUCCESS;
+ 	}
+@@ -555,13 +605,17 @@
+ 	                        secrets,
+ 	                        vpn_uuid,
+ 	                        need_password,
++							need_pin,
+ 	                        need_certpass,
+ 	                        need_proxypass,
+ 	                        &existing_password,
++							&existing_pin,
+ 	                        &existing_certpass,
+ 	                        &existing_proxypass);
+ 	if (need_password && !existing_password)
+ 		ask_user = TRUE;
++	else if (need_pin && !existing_pin)
++	    ask_user = TRUE;
+ 	else if (need_certpass && !existing_certpass)
+ 		ask_user = TRUE;
+ 	else if (need_proxypass && !existing_proxypass)
+@@ -582,6 +636,9 @@
+ 		                    need_password,
+ 		                    existing_password,
+ 		                    &new_password,
++							need_pin,
++							existing_pin,
++							&new_pin,
+ 		                    need_certpass,
+ 		                    existing_certpass,
+ 		                    &new_certpass,
+@@ -596,6 +653,8 @@
+ 	             allow_interaction,
+ 	             need_password,
+ 	             new_password ? new_password : existing_password,
++				 need_pin,
++				 new_pin ? new_pin : existing_pin,
+ 	             need_certpass,
+ 	             new_certpass ? new_certpass : existing_certpass,
+ 	             need_proxypass,
+diff --color -ur NetworkManager-openvpn-1.12.0/properties/import-export.c NetworkManager-openvpn-1.12.0-new/properties/import-export.c
+--- NetworkManager-openvpn-1.12.0/properties/import-export.c	2024-05-03 14:17:49.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/properties/import-export.c	2024-09-07 22:18:09.208766476 +0300
+@@ -792,7 +792,7 @@
+ 	char *tmp, *tmp2;
+ 	const char *ta_direction = NULL, *secret_direction = NULL;
+ 	gboolean allow_ta_direction = FALSE, allow_secret_direction = FALSE;
+-	gboolean have_cert = FALSE, have_key = FALSE, have_ca = FALSE, have_pkcs12 = FALSE;
++	gboolean have_cert = FALSE, have_key = FALSE, have_ca = FALSE, have_pkcs11 = FALSE, have_pkcs12 = FALSE;
+ 	const char *cert_path = NULL, *key_path = NULL, *ca_path = NULL;
+ 	GSList *inline_blobs = NULL;
+ 	GSList *sl_iter;
+@@ -1524,6 +1524,26 @@
+ 			nm_ip_route_unref (route);
+ 		}
+ 
++		if (NM_IN_STRSET (params[0], NMV_OVPN_TAG_PKCS11_ID)) {
++			if (!args_params_check_nargs_n (params, 1, &line_error))
++				goto handle_line_error;
++			if (!args_params_check_arg_nonempty (params, 1, NULL, &line_error))
++				goto handle_line_error;
++			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, params[1]);
++			continue;
++
++		}
++
++		if (NM_IN_STRSET (params[0], NMV_OVPN_TAG_PKCS11_PROVIDERS)) {
++			if (!args_params_check_nargs_n (params, 1, &line_error))
++				goto handle_line_error;
++			if (!args_params_check_arg_nonempty (params, 1, NULL, &line_error))
++				goto handle_line_error;
++			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, params[1]);
++			continue;
++		}
++
++
+ 		if (params[0][0] == '<' && params[0][strlen (params[0]) - 1] == '>') {
+ 			gs_free char *token = g_strndup (&params[0][1], strlen (params[0]) - 2);
+ 			gs_free char *end_token = NULL;
+@@ -1740,10 +1760,14 @@
+ 	if (have_pass) {
+ 		if (have_cert || have_pkcs12)
+ 			ctype = NM_OPENVPN_CONTYPE_PASSWORD_TLS;
++		else if (have_cert && have_pkcs11)
++			ctype = NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11;
+ 		else if (have_ca)
+ 			ctype = NM_OPENVPN_CONTYPE_PASSWORD;
+ 	} else if (have_cert || have_pkcs12) {
+ 		ctype = NM_OPENVPN_CONTYPE_TLS;
++	} else if (have_cert && have_pkcs11) {
++		ctype = NM_OPENVPN_CONTYPE_TLS_PKCS11;
+ 	} else if (have_sk)
+ 		ctype = NM_OPENVPN_CONTYPE_STATIC_KEY;
+ 
+diff --color -ur NetworkManager-openvpn-1.12.0/properties/nm-openvpn-dialog.ui NetworkManager-openvpn-1.12.0-new/properties/nm-openvpn-dialog.ui
+--- NetworkManager-openvpn-1.12.0/properties/nm-openvpn-dialog.ui	2023-12-14 23:51:21.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/properties/nm-openvpn-dialog.ui	2024-09-07 22:18:09.211766445 +0300
+@@ -179,7 +179,7 @@
+           <object class="GtkLabel" id="label22">
+             <property name="visible">True</property>
+             <property name="can_focus">False</property>
+-            <property name="label" translatable="yes">General</property>
++            <property name="label" translatable="yes">General 123</property>
+             <property name="xalign">0</property>
+             <attributes>
+               <attribute name="weight" value="bold"/>
+@@ -307,6 +307,136 @@
+                   </object>
+                 </child>
+                 <child type="tab">
++                  <object class="GtkLabel" id="label17">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="label">page 4</property>
++                  </object>
++                  <packing>
++                    <property name="position">3</property>
++                    <property name="tab_fill">False</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkBox" id="tls_pkcs11">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="valign">start</property>
++                    <property name="orientation">vertical</property>
++                    <property name="spacing">6</property>
++                    <child>
++                      <object class="GtkGrid">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="row_spacing">6</property>
++                        <property name="column_spacing">12</property>
++                        <child>
++                          <object class="GtkLabel" id="label37">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">PKCS#11 id:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">1</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label38">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label"
++                                      translatable="yes">PKCS#11 providers:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">0</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label40">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label"
++                                      translatable="yes">PKCS#11 pin:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="tls_pkcs11_pin_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text"
++                                      translatable="yes">PIN of PKCS#11 token</property>
++                            <property name="hexpand">True</property>
++                            <property name="visibility">False</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">2</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="tls_pkcs11_id_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                           <property name="tooltip_text"
++                                      translatable="yes">ID of certificate to use config: pkcs11-id</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">1</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="tls_pkcs11_providers_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text"
++                                      translatable="yes">Shared lib used to access the pkc#11 functions config: pkcs11-providers</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">0</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="NMACertChooser" id="tls_pkcs11_ca_cert">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="title" translatable="yes">CA</property>
++                        <property name="flags">5</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">1</property>
++                      </packing>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="position">1</property>
++                  </packing>
++                </child>
++                <child type="tab">
+                   <object class="GtkLabel" id="label14">
+                     <property name="visible">True</property>
+                     <property name="can_focus">False</property>
+@@ -517,6 +647,200 @@
+                   </object>
+                 </child>
+                 <child type="tab">
++                  <object class="GtkLabel" id="label36">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="label">page 2</property>
++                  </object>
++                  <packing>
++                    <property name="position">1</property>
++                    <property name="tab_fill">False</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkBox" id="pw_tls_pkcs11">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="valign">start</property>
++                    <property name="orientation">vertical</property>
++                    <property name="spacing">6</property>
++                    <child>
++                      <object class="GtkGrid">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="row_spacing">6</property>
++                        <property name="column_spacing">12</property>
++                        <child>
++                          <object class="GtkLabel" id="label41">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">Password:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">1</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label42">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">User name:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">0</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pw_tls_pkcs11_password_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text" translatable="yes">Password passed to OpenVPN when prompted for it. config: auth-user-pass</property>
++                            <property name="hexpand">True</property>
++                            <property name="visibility">False</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">1</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pw_tls_pkcs11_username_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text" translatable="yes">Username passed to OpenVPN when prompted for it. If omitted, use the ame of the system user that activates the connection. config: auth-user-pass</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">0</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="NMACertChooser" id="pw_tls_pkcs11_ca_cert">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="title" translatable="yes">CA</property>
++                        <property name="flags">5</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">1</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="GtkGrid">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="row_spacing">6</property>
++                        <property name="column_spacing">12</property>
++                        <child>
++                          <object class="GtkLabel" id="label43">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">PKCS#11 id:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">1</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label44">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label"
++                                      translatable="yes">PKCS#11 providers:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">0</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label45">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label"
++                                      translatable="yes">PKCS#11 pin:</property>
++                            <property name="xalign">0</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pw_tls_pkcs11_pin_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text"
++                                      translatable="yes">PIN of PKCS#11 token</property>
++                            <property name="hexpand">True</property>
++                            <property name="visibility">False</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">2</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pw_tls_pkcs11_id_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text"
++                                      translatable="yes">ID of certificate to use config: pkcs11-id</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">1</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pw_tls_pkcs11_providers_entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text"
++                                      translatable="yes">Shared lib used to access the pkc#11 functions config: pkcs11-providers</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">0</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">2</property>
++                      </packing>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="position">4</property>
++                  </packing>
++                </child>
++                <child type="tab">
+                   <object class="GtkLabel" id="label16">
+                     <property name="visible">True</property>
+                     <property name="can_focus">False</property>
+@@ -684,17 +1008,6 @@
+                     </child>
+                   </object>
+                 </child>
+-                <child type="tab">
+-                  <object class="GtkLabel" id="label17">
+-                    <property name="visible">True</property>
+-                    <property name="can_focus">False</property>
+-                    <property name="label">page 4</property>
+-                  </object>
+-                  <packing>
+-                    <property name="position">3</property>
+-                    <property name="tab_fill">False</property>
+-                  </packing>
+-                </child>
+               </object>
+               <packing>
+                 <property name="left_attach">0</property>
+@@ -806,6 +1119,10 @@
+       <widget name="label20"/>
+       <widget name="label12"/>
+       <widget name="label11"/>
++      <widget name="label37"/>
++      <widget name="label38"/>
++      <widget name="label42"/>
++      <widget name="label44"/>
+       <widget name="auth_label"/>
+     </widgets>
+   </object>
+diff --color -ur NetworkManager-openvpn-1.12.0/properties/nm-openvpn-editor.c NetworkManager-openvpn-1.12.0-new/properties/nm-openvpn-editor.c
+--- NetworkManager-openvpn-1.12.0/properties/nm-openvpn-editor.c	2024-05-03 14:17:49.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/properties/nm-openvpn-editor.c	2024-09-07 22:18:09.213766425 +0300
+@@ -269,6 +269,54 @@
+ }
+ 
+ static void
++pkcs11_setup (GtkBuilder *builder,
++			  NMSettingVpn *s_vpn,
++			  const char *prefix,
++			  ChangedCallback changed_cb,
++			  gpointer user_data)
++{
++	GtkWidget *widget;
++	const char *value;
++	char namebuf[150];
++
++	/* Fill in providers */
++	nm_sprintf_buf (namebuf, "%s_providers_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++
++	if (s_vpn) {
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++		if (value && *value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
++
++	/* Fill in id */
++	nm_sprintf_buf (namebuf, "%s_id_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++
++	if (s_vpn) {
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
++		if (value && *value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
++
++	/* Fill in the pin */
++	nm_sprintf_buf (namebuf, "%s_pin_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++	g_signal_connect (widget, "changed", G_CALLBACK (changed_cb), user_data);
++
++	if (s_vpn) {
++		value = nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PKCS11_PIN);
++		if (value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++
++	nma_utils_setup_password_storage (widget, 0, (NMSetting *) s_vpn, NM_OPENVPN_KEY_PKCS11_PIN,
++	                                  TRUE, FALSE);
++}
++
++static void
+ tls_pw_init_auth_widget (GtkBuilder *builder,
+                          NMSettingVpn *s_vpn,
+                          const char *contype,
+@@ -279,7 +327,7 @@
+ 	NMACertChooser *ca;
+ 	const char *value;
+ 	char namebuf[150];
+-	gboolean tls = FALSE, pw = FALSE;
++	gboolean tls = FALSE, pw = FALSE, pkcs11 = FALSE;
+ 
+ 	g_return_if_fail (builder != NULL);
+ 	g_return_if_fail (changed_cb != NULL);
+@@ -290,10 +338,17 @@
+ 	nma_cert_chooser_add_to_size_group (ca, GTK_SIZE_GROUP (gtk_builder_get_object (builder, "labels")));
+ 
+ 	/* Three major connection types here: TLS-only, PW-only, and TLS + PW */
+-	if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS) || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS))
++	if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS)
++	    || !strcmp (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11)
++        || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++		|| !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
+ 		tls = TRUE;
+-	if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD) || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS))
++	if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)
++	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++		|| !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
+ 		pw = TRUE;
++	if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11) || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
++		pkcs11 = TRUE;
+ 
+ 	g_signal_connect (ca, "changed", G_CALLBACK (changed_cb), user_data);
+ 	if (s_vpn) {
+@@ -307,6 +362,9 @@
+ 		tls_setup (builder, s_vpn, prefix, ca, changed_cb, user_data);
+ 	if (pw)
+ 		pw_setup (builder, s_vpn, prefix, changed_cb, user_data);
++	if (pkcs11)
++		pkcs11_setup (builder, s_vpn, prefix, changed_cb, user_data);
++
+ }
+ 
+ static void
+@@ -479,6 +537,40 @@
+ }
+ 
+ static gboolean
++validate_pkcs11 (GtkBuilder *builder, const char *prefix, GError **error)
++{
++	GtkWidget *widget;
++	char namebuf[150];
++	const char *str;
++
++	/* We need a provider */
++	nm_sprintf_buf (namebuf, "%s_providers_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (!str || !*str) {
++		g_set_error (error,
++					 NMV_EDITOR_PLUGIN_ERROR,
++					 NMV_EDITOR_PLUGIN_ERROR_INVALID_PROPERTY,
++					 NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++		return FALSE;
++	}
++
++	/* We need an id */
++	nm_sprintf_buf (namebuf, "%s_id_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (!str || !*str) {
++		g_set_error (error,
++					 NMV_EDITOR_PLUGIN_ERROR,
++					 NMV_EDITOR_PLUGIN_ERROR_INVALID_PROPERTY,
++					 NM_OPENVPN_KEY_PKCS11_ID);
++		return FALSE;
++	}
++
++	return TRUE;
++}
++
++static gboolean
+ auth_widget_check_validity (GtkBuilder *builder, const char *contype, GError **error)
+ {
+ 	GtkWidget *widget;
+@@ -492,6 +584,12 @@
+ 	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
+ 		if (!validate_tls (builder, "pw_tls", error))
+ 			return FALSE;
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11)) {
++		if (!validate_tls (builder, "tls_pkcs11", error) || !validate_pkcs11 (builder, "tls_pkcs11", error))
++			return FALSE;
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)) {
++		if (!validate_tls (builder, "tls_pkcs11", error) || !validate_pkcs11 (builder, "pw_tls_pkcs11", error))
++			return FALSE;
+ 	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		if (!validate_cert_chooser (builder, "pw_ca_cert", &local)) {
+ 			g_set_error (error,
+@@ -628,6 +726,40 @@
+ 	nm_setting_set_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PASSWORD, pw_flags, NULL);
+ }
+ 
++static void
++update_pkcs11 (GtkBuilder *builder, const char *prefix, NMSettingVpn *s_vpn)
++{
++	GtkWidget *widget;
++	NMSettingSecretFlags pw_flags;
++	char namebuf[150];
++	const char *str;
++
++	g_return_if_fail (builder != NULL);
++	g_return_if_fail (prefix != NULL);
++	g_return_if_fail (s_vpn != NULL);
++
++	nm_sprintf_buf (namebuf, "%s_providers_entry", prefix);
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, namebuf));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, str);
++
++	nm_sprintf_buf (namebuf, "%s_id_entry", prefix);
++	widget = (GtkWidget *) gtk_builder_get_object (builder, namebuf);
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, str);
++
++	nm_sprintf_buf (namebuf, "%s_pin_entry", prefix);
++	widget = (GtkWidget *) gtk_builder_get_object (builder, namebuf);
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_secret (s_vpn, NM_OPENVPN_KEY_PKCS11_PIN, str);
++	pw_flags = nma_utils_menu_to_secret_flags (widget);
++	nm_setting_set_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PKCS11_PIN, pw_flags, NULL);
++}
++
++
+ static gboolean
+ auth_widget_update_connection (GtkBuilder *builder,
+                                const char *contype,
+@@ -642,6 +774,10 @@
+ 
+ 	if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS)) {
+ 		update_tls (builder, "tls", s_vpn);
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11)) {
++		update_tls (builder, "tls_pkcs11", s_vpn);
++		update_pkcs11 (builder, "tls_pkcs11", s_vpn);
++
+ 	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		update_from_cert_chooser (builder, NM_OPENVPN_KEY_CA, NULL, NULL,
+ 		                          "pw", "ca_cert", s_vpn);
+@@ -649,6 +785,10 @@
+ 	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
+ 		update_tls (builder, "pw_tls", s_vpn);
+ 		update_pw (builder, "pw_tls", s_vpn);
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)) {
++		update_tls (builder, "pw_tls_pkcs11", s_vpn);
++		update_pw (builder, "pw_tls_pkcs11", s_vpn);
++		update_pkcs11 (builder, "pw_tls_pkcs11", s_vpn);
+ 	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_STATIC_KEY)) {
+ 		/* Update static key */
+ 		widget = GTK_WIDGET (gtk_builder_get_object (builder, "sk_key_chooser"));
+@@ -1815,7 +1955,9 @@
+ 	                          "clicked", G_CALLBACK (gtk_widget_show), chooser);
+ 	if (NM_IN_STRSET (contype,
+ 	                  NM_OPENVPN_CONTYPE_TLS,
++	                  NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++					  NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		/* Initialize direction combo */
+ 		combo = GTK_WIDGET (gtk_builder_get_object (builder, "direction_combo"));
+@@ -1867,7 +2009,9 @@
+ 	                          "clicked", G_CALLBACK (gtk_widget_show), chooser);
+ 	if (NM_IN_STRSET (contype,
+ 	                  NM_OPENVPN_CONTYPE_TLS,
++					  NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++					  NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		value = g_hash_table_lookup (hash, NM_OPENVPN_KEY_EXTRA_CERTS);
+ 		if (value && value[0]) {
+@@ -2256,7 +2400,9 @@
+ 
+ 	contype = g_object_get_data (G_OBJECT (dialog), "connection-type");
+ 	if (   !strcmp (contype, NM_OPENVPN_CONTYPE_TLS)
++	    || !strcmp (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11)
+ 	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++		|| !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)
+ 	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		char *filename;
+ 		GFile *file;
+@@ -2711,9 +2857,11 @@
+ 	if (s_vpn) {
+ 		contype = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_CONNECTION_TYPE);
+ 		if (!NM_IN_STRSET (contype, NM_OPENVPN_CONTYPE_TLS,
++		                            NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 		                            NM_OPENVPN_CONTYPE_STATIC_KEY,
+ 		                            NM_OPENVPN_CONTYPE_PASSWORD,
+-		                            NM_OPENVPN_CONTYPE_PASSWORD_TLS))
++		                            NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++									NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
+ 			contype = NM_OPENVPN_CONTYPE_TLS;
+ 	}
+ 
+@@ -2728,6 +2876,20 @@
+ 	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_TLS,
+ 	                    -1);
+ 
++	/* TLS auth widget (PKCS11-mode) */
++	tls_pw_init_auth_widget (priv->builder, s_vpn,
++	                         NM_OPENVPN_CONTYPE_TLS_PKCS11, "tls_pkcs11",
++	                         stuff_changed_cb, self);
++	gtk_list_store_append (store, &iter);
++	gtk_list_store_set (store, &iter,
++	                    COL_AUTH_NAME, _("Certificates (TLS), PKCS#11"),
++	                    COL_AUTH_PAGE, 1,
++	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_TLS_PKCS11,
++	                    -1);
++	if (   active < 0 
++	    && nm_streq (contype, NM_OPENVPN_CONTYPE_TLS_PKCS11))
++		active = 1;
++
+ 	/* Password auth widget */
+ 	tls_pw_init_auth_widget (priv->builder, s_vpn,
+ 	                         NM_OPENVPN_CONTYPE_PASSWORD, "pw",
+@@ -2735,12 +2897,12 @@
+ 	gtk_list_store_append (store, &iter);
+ 	gtk_list_store_set (store, &iter,
+ 	                    COL_AUTH_NAME, _("Password"),
+-	                    COL_AUTH_PAGE, 1,
++	                    COL_AUTH_PAGE, 2,
+ 	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_PASSWORD,
+ 	                    -1);
+ 	if (   active < 0
+ 	    && nm_streq (contype, NM_OPENVPN_CONTYPE_PASSWORD))
+-		active = 1;
++		active = 2;
+ 
+ 	/* Password+TLS auth widget */
+ 	tls_pw_init_auth_widget (priv->builder, s_vpn,
+@@ -2749,12 +2911,27 @@
+ 	gtk_list_store_append (store, &iter);
+ 	gtk_list_store_set (store, &iter,
+ 	                    COL_AUTH_NAME, _("Password with Certificates (TLS)"),
+-	                    COL_AUTH_PAGE, 2,
++	                    COL_AUTH_PAGE, 3,
+ 	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_PASSWORD_TLS,
+ 	                    -1);
+ 	if (   active < 0
+ 	    && nm_streq (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS))
+-		active = 2;
++		active = 3;
++
++	/* Password+TLS auth widget (PKCS11-mode) */
++	tls_pw_init_auth_widget (priv->builder, s_vpn,
++	                         NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11, "pw_tls_pkcs11",
++	                         stuff_changed_cb, self);
++	gtk_list_store_append (store, &iter);
++	gtk_list_store_set (store, &iter,
++	                    COL_AUTH_NAME, _("Password with Certificates (TLS), PKCS#11"),
++	                    COL_AUTH_PAGE, 4,
++	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11,
++	                    -1);
++	if (   active < 0
++	    && nm_streq (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11))
++		active = 4;
++
+ 
+ 	/* Static key auth widget */
+ 	sk_init_auth_widget (priv->builder, s_vpn, stuff_changed_cb, self);
+@@ -2762,12 +2939,12 @@
+ 	gtk_list_store_append (store, &iter);
+ 	gtk_list_store_set (store, &iter,
+ 	                    COL_AUTH_NAME, _("Static Key"),
+-	                    COL_AUTH_PAGE, 3,
++	                    COL_AUTH_PAGE, 5,
+ 	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_STATIC_KEY,
+ 	                    -1);
+ 	if (   active < 0
+ 	    && nm_streq (contype, NM_OPENVPN_CONTYPE_STATIC_KEY))
+-		active = 3;
++		active = 5;
+ 
+ 	gtk_combo_box_set_model (GTK_COMBO_BOX (widget), GTK_TREE_MODEL (store));
+ 	g_object_unref (store);
+diff --color -ur NetworkManager-openvpn-1.12.0/shared/nm-service-defines.h NetworkManager-openvpn-1.12.0-new/shared/nm-service-defines.h
+--- NetworkManager-openvpn-1.12.0/shared/nm-service-defines.h	2024-05-03 14:17:49.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/shared/nm-service-defines.h	2024-09-07 22:29:50.629419809 +0300
+@@ -59,6 +59,8 @@
+ #define NM_OPENVPN_KEY_PING                      "ping"
+ #define NM_OPENVPN_KEY_PING_EXIT                 "ping-exit"
+ #define NM_OPENVPN_KEY_PING_RESTART              "ping-restart"
++#define NM_OPENVPN_KEY_PKCS11_ID                 "pkcs11-id"
++#define NM_OPENVPN_KEY_PKCS11_PROVIDERS          "pkcs11-providers"
+ #define NM_OPENVPN_KEY_PORT                      "port"
+ #define NM_OPENVPN_KEY_PROTO_TCP                 "proto-tcp"
+ #define NM_OPENVPN_KEY_PROXY_PORT                "proxy-port"
+@@ -91,11 +93,13 @@
+ 
+ #define NM_OPENVPN_KEY_PASSWORD                  "password"
+ #define NM_OPENVPN_KEY_CERTPASS                  "cert-pass"
++#define NM_OPENVPN_KEY_PKCS11_PIN                "pkcs11-pin"
+ #define NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD       "http-proxy-password"
+ #define NM_OPENVPN_KEY_CHALLENGE_RESPONSE        "challenge-response"
+ 
+ #define NM_OPENVPN_KEY_PASSWORD_FLAGS            "password-flags"
+ #define NM_OPENVPN_KEY_CERTPASS_FLAGS            "cert-pass-flags"
++#define NM_OPENVPN_KEY_PKCS11_PIN_FLAGS          "pkcs11-pin-flags"
+ #define NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD_FLAGS "http-proxy-password-flags"
+ #define NM_OPENVPN_KEY_CHALLENGE_RESPONSE_FLAGS  "challenge-response-flags"
+ 
+@@ -121,8 +125,10 @@
+ 
+ #define NM_OPENVPN_CONTYPE_PASSWORD     "password"
+ #define NM_OPENVPN_CONTYPE_PASSWORD_TLS "password-tls"
++#define NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11 "password-tls-pkcs11"
+ #define NM_OPENVPN_CONTYPE_STATIC_KEY   "static-key"
+ #define NM_OPENVPN_CONTYPE_TLS          "tls"
++#define NM_OPENVPN_CONTYPE_TLS_PKCS11   "tls-pkcs11"
+ 
+ /* arguments of "--remote-cert-tls" */
+ #define NM_OPENVPN_REM_CERT_TLS_CLIENT "client"
+diff --color -ur NetworkManager-openvpn-1.12.0/shared/utils.h NetworkManager-openvpn-1.12.0-new/shared/utils.h
+--- NetworkManager-openvpn-1.12.0/shared/utils.h	2023-12-14 23:51:21.000000000 +0300
++++ NetworkManager-openvpn-1.12.0-new/shared/utils.h	2024-09-07 22:18:09.214766415 +0300
+@@ -61,6 +61,8 @@
+ #define NMV_OVPN_TAG_PING                   "ping"
+ #define NMV_OVPN_TAG_PING_EXIT              "ping-exit"
+ #define NMV_OVPN_TAG_PING_RESTART           "ping-restart"
++#define NMV_OVPN_TAG_PKCS11_ID				"pkcs11-id"
++#define NMV_OVPN_TAG_PKCS11_PROVIDERS		"pkcs11-providers"
+ #define NMV_OVPN_TAG_PKCS12                 "pkcs12"
+ #define NMV_OVPN_TAG_PORT                   "port"
+ #define NMV_OVPN_TAG_PROTO                  "proto"
+diff --color -ur NetworkManager-openvpn-1.12.5/src/nm-openvpn-service.c NetworkManager-openvpn-1.12.5-new/src/nm-openvpn-service.c
+--- NetworkManager-openvpn-1.12.5/src/nm-openvpn-service.c	2025-12-22 12:34:09.000000000 +0300
++++ NetworkManager-openvpn-1.12.5-new/src/nm-openvpn-service.c	2026-01-12 13:47:33.184529012 +0300
+@@ -98,6 +98,7 @@
+ 	char *default_username;
+ 	char *username;
+ 	char *password;
++	char *pin;
+ 	char *priv_key_pass;
+ 	char *proxy_username;
+ 	char *proxy_password;
+@@ -198,6 +199,9 @@
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MIN,           G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MIN_OR_HIGHEST,G_TYPE_BOOLEAN, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MAX,           G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_PIN_FLAGS,          G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_ID,                 G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_PROVIDERS,          G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_CHALLENGE_RESPONSE_FLAGS,  G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NULL,                                     G_TYPE_NONE, FALSE }
+ };
+@@ -205,6 +209,7 @@
+ static const ValidProperty valid_secrets[] = {
+ 	{ NM_OPENVPN_KEY_PASSWORD,             G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_CERTPASS,             G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_PIN,           G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_NOSECRET,             G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD,  G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_CHALLENGE_RESPONSE,   G_TYPE_STRING, 0, 0, FALSE },
+@@ -239,17 +244,21 @@
+ validate_connection_type (const char *ctype)
+ {
+ 	return NM_IN_STRSET (ctype, NM_OPENVPN_CONTYPE_TLS,
++	 							NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 	                            NM_OPENVPN_CONTYPE_STATIC_KEY,
+ 	                            NM_OPENVPN_CONTYPE_PASSWORD,
+-	                            NM_OPENVPN_CONTYPE_PASSWORD_TLS);
++	                            NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++								NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11);
+ }
+ 
+ static gboolean
+ connection_type_is_tls_mode (const char *connection_type)
+ {
+ 	return NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
++										  NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 	                                      NM_OPENVPN_CONTYPE_PASSWORD,
+-	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS);
++	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++										  NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11);
+ }
+ 
+ /*****************************************************************************/
+@@ -464,6 +473,13 @@
+ 	return TRUE;
+ }
+ 
++static void
++args_add_pkcs11 (GPtrArray *args, NMSettingVpn *s_vpn)
++{
++	args_add_vpn_data (args, s_vpn, NM_OPENVPN_KEY_PKCS11_ID, "--pkcs11-id");
++	args_add_vpn_data (args, s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, "--pkcs11-providers");
++}
++
+ /*****************************************************************************/
+ 
+ static gboolean
+@@ -856,6 +872,10 @@
+ 		memset (io_data->password, 0, strlen (io_data->password));
+ 	g_free (io_data->password);
+ 
++	if (io_data->pin)
++		memset (io_data->pin, 0, strlen (io_data->pin));
++	g_free (io_data->pin);
++
+ 	if (io_data->priv_key_pass)
+ 		memset (io_data->priv_key_pass, 0, strlen (io_data->priv_key_pass));
+ 	g_free (io_data->priv_key_pass);
+@@ -1079,6 +1099,26 @@
+ 				*out_message = _("An HTTP Proxy username and password are required.");
+ 		}
+ 		handled = TRUE;
++	} else if (nm_streq (requested_auth + strlen (requested_auth) - strlen (" token"), " token")) {
++		if (io_data->pin) {
++			char *pin, *buf;
++
++			/* Quote strings passed back to openvpn */
++			pin = ovpn_quote_string (io_data->pin);
++			buf = g_strdup_printf ("password \"%s\" \"%s\"\n", requested_auth, pin);
++			memset (pin, 0, strlen (pin));
++			g_free (pin);
++
++			/* Will always write everything in blocking channels (on success) */
++			g_io_channel_write_chars (io_data->socket_channel, buf, strlen (buf), NULL, NULL);
++			g_io_channel_flush (io_data->socket_channel, NULL);
++			g_free (buf);
++		} else {
++			hints = g_new0 (const char *, 2);
++			hints[i++] = NM_OPENVPN_KEY_PKCS11_PIN;
++			*out_message = _("A PKCS#11 PIN is required.");
++		}
++		handled = TRUE;
+ 	}
+ 
+ 	*out_hints = g_steal_pointer (&hints);
+@@ -1191,6 +1231,18 @@
+ 		g_free (auth);
+ 	}
+ 
++	/*
++	 * Handle >NEED-OK:Need statements,
++	 * for example: >NEED-OK:Need 'token-insertion-request' confirmation MSG:Please insert PIV Card Holder pin (PIV_II) token
++	 */
++	auth = get_detail (str, ">NEED-OK:Need '");
++	if (auth) {
++		_LOGW ("Unhandled management socket request '%s'", auth);
++		*out_failure = NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED;
++		again = FALSE;
++	}
++
++
+ out:
+ 	g_free (str);
+ 	return again;
+@@ -1330,6 +1382,12 @@
+ 	}
+ 	io_data->challenge_response = g_strdup (nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CHALLENGE_RESPONSE));
+ 
++	if (io_data->pin) {
++		memset (io_data->pin, 0, strlen (io_data->pin));
++		g_free (io_data->pin);
++	}
++	io_data->pin = g_strdup (nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PKCS11_PIN));
++
+ 	if (io_data->priv_key_pass) {
+ 		memset (io_data->priv_key_pass, 0, strlen (io_data->priv_key_pass));
+ 		g_free (io_data->priv_key_pass);
+@@ -2083,6 +2141,11 @@
+ 		args_add_strv (args, "--client");
+ 		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
+ 			return FALSE;
++	} else if (nm_streq (connection_type, NM_OPENVPN_CONTYPE_TLS_PKCS11)) {
++		args_add_strv (args, "--client");
++		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
++			return FALSE;
++		args_add_pkcs11 (args, s_vpn);
+ 	} else if (nm_streq (connection_type, NM_OPENVPN_CONTYPE_STATIC_KEY)) {
+ 		tmp = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_STATIC_KEY);
+ 		if (nmovpn_arg_is_set (tmp)) {
+@@ -2110,6 +2173,13 @@
+ 			return FALSE;
+ 		/* Use user/path authentication */
+ 		args_add_strv (args, "--auth-user-pass");
++	} else if (nm_streq (connection_type, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)) {
++		args_add_strv (args, "--client");
++		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
++			return FALSE;
++		/* Use user/path authentication */
++		args_add_strv (args, "--auth-user-pass");
++		args_add_pkcs11 (args, s_vpn);
+ 	} else {
+ 		g_set_error (error,
+ 		             NM_VPN_PLUGIN_ERROR,
+@@ -2181,8 +2251,10 @@
+ 	   X509: May require certificate password
+ 	*/
+ 	if (   NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
++										  NM_OPENVPN_CONTYPE_TLS_PKCS11,
+ 	                                      NM_OPENVPN_CONTYPE_PASSWORD,
+-	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++										  NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)
+ 	    || nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_HTTP_PROXY_USERNAME)) {
+ 
+ 		priv->io_data = g_malloc0 (sizeof (NMOpenvpnPluginIOData));
+@@ -2224,6 +2296,31 @@
+ 					*need_secrets = FALSE;
+ 			}
+ 		}
++	} else if (nm_streq (ctype, NM_OPENVPN_CONTYPE_PASSWORD_TLS_PKCS11)) {
++		/* Will require a password and maybe private key password and PKCS#11 PIN*/
++		key = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_KEY);
++		key = nm_utils_str_utf8safe_unescape (key, &key_free);
++		if (is_encrypted (key) && !nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS)) {
++			*need_secrets = TRUE;
++		}
++
++		if (!nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PASSWORD)) {
++			*need_secrets = TRUE;
++			if (nm_setting_get_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PASSWORD, &secret_flags, NULL)) {
++				if (secret_flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED) {
++					*need_secrets = FALSE;
++				}
++			}
++		}
++
++		if (!nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PKCS11_PIN)) {
++			*need_secrets = TRUE;
++			if (nm_setting_get_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PKCS11_PIN, &secret_flags, NULL)) {
++				if (secret_flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED) {
++					*need_secrets = FALSE;
++				}
++			}
++		}
+ 	} else if (nm_streq (ctype, NM_OPENVPN_CONTYPE_PASSWORD)) {
+ 		/* Will require a password */
+ 		if (!nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PASSWORD)) {
+@@ -2239,6 +2336,20 @@
+ 		key = nm_utils_str_utf8safe_unescape (key, &key_free);
+ 		if (is_encrypted (key) && !nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS))
+ 			*need_secrets = TRUE;
++	} else if (nm_streq (ctype, NM_OPENVPN_CONTYPE_TLS_PKCS11)) {
++		/* May require private key password and PKCS#11 PIN */
++		key = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_KEY);
++		key = nm_utils_str_utf8safe_unescape (key, &key_free);
++		if (is_encrypted (key) && !nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS))
++			*need_secrets = TRUE;
++
++		if (!nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_PKCS11_PIN)) {
++			*need_secrets = TRUE;
++			if (nm_setting_get_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PKCS11_PIN, &secret_flags, NULL)) {
++				if (secret_flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED)
++					*need_secrets = FALSE;
++			}
++		}
+ 	} else {
+ 		/* Static key doesn't need passwords */
+ 	}

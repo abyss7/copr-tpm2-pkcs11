@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Mon, 25 May 2026 14:27:02 +0200
+Subject: [PATCH] pkcs11: small improvements
+
+---
+ properties/nm-openvpn-editor.c        | 11 +++++------
+ properties/tests/conf/pkcs11.ovpn     |  2 +-
+ properties/tests/test-import-export.c |  2 +-
+ 3 files changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index cf1790e..956672a 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -326,27 +326,26 @@ pkcs11_provider_changed_cb (GtkComboBox *provider_combo, gpointer user_data)
+ static void
+ pkcs11_populate_providers (GtkComboBoxText *combo)
+ {
+-	CK_FUNCTION_LIST **modules;
+-	int i;
++	CK_FUNCTION_LIST **modules, **module_iter;
+ 
+ 	modules = p11_kit_modules_load_and_initialize (0);
+ 	if (!modules)
+ 		return;
+ 
+-	for (i = 0; modules[i] != NULL; i++) {
++	for (module_iter = modules; *module_iter != NULL; module_iter++) {
+ 		char *path;
+ 		int flags;
+ 
+-		flags = p11_kit_module_get_flags (modules[i]);
++		flags = p11_kit_module_get_flags (*module_iter);
+ 		if (flags & P11_KIT_MODULE_TRUSTED)
+ 			continue;
+ 
+-		path = p11_kit_module_get_filename (modules[i]);
++		path = p11_kit_module_get_filename (*module_iter);
+ 		if (path) {
+ 			CK_INFO info;
+ 			gs_free char *label = NULL;
+ 
+-			if (modules[i]->C_GetInfo (&info) == CKR_OK) {
++			if ((*module_iter)->C_GetInfo (&info) == CKR_OK) {
+ 				gs_free char *manufacturer = g_strstrip (g_strndup ((char *)info.manufacturerID, 32));
+ 				gs_free char *description = g_strstrip (g_strndup ((char *)info.libraryDescription, 32));
+ 
+diff --git a/properties/tests/conf/pkcs11.ovpn b/properties/tests/conf/pkcs11.ovpn
+index 0144023..22958d9 100644
+--- a/properties/tests/conf/pkcs11.ovpn
++++ b/properties/tests/conf/pkcs11.ovpn
+@@ -2,7 +2,7 @@ client
+ dev tun
+ ca keys/mine-ca.crt
+ tls-auth keys/mine-tls.key
+-remote 173.8.149.245 1194
++remote 203.0.113.10 1194
+ proto tcp
+ persist-key
+ persist-tun
+diff --git a/properties/tests/test-import-export.c b/properties/tests/test-import-export.c
+index f7b4497..cc3d621 100644
+--- a/properties/tests/test-import-export.c
++++ b/properties/tests/test-import-export.c
+@@ -666,7 +666,7 @@ test_pkcs11_import (void)
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_CONNECTION_TYPE, NM_OPENVPN_CONTYPE_PKCS11);
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_DEV, "tun");
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_PROTO_TCP, "yes");
+-	_check_item (s_vpn, NM_OPENVPN_KEY_REMOTE, "173.8.149.245:1194");
++	_check_item (s_vpn, NM_OPENVPN_KEY_REMOTE, "203.0.113.10:1194");
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_PORT, NULL);
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_CIPHER, "AES-256-GCM");
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_REMOTE_IP, NULL);

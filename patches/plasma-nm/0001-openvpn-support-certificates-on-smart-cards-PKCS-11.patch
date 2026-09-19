@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Lezhankin <abyss.7@gmail.com>
+Date: Sat, 19 Sep 2026 14:05:03 +0300
+Subject: [PATCH] openvpn: support certificates on smart cards (PKCS#11)
+
+Add the "pkcs11" connection type of NetworkManager-openvpn (see
+NetworkManager-openvpn!108): the certificate and key are referenced by a
+PKCS#11 ID (--pkcs11-id) and the smart card PIN is the cert-pass secret.
+
+The Detect button lists the certificates of the plugged in tokens with
+"openvpn --show-pkcs11-ids" through the p11-kit proxy module.
+
+The PIN is always masked in the password dialog, even when the prompt
+mentions a "token".
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ vpn/openvpn/CMakeLists.txt       |   7 ++
+ vpn/openvpn/nm-openvpn-service.h |   2 +
+ vpn/openvpn/openvpn.ui           | 108 +++++++++++++++++++++++
+ vpn/openvpn/openvpnauth.cpp      |  16 +++-
+ vpn/openvpn/openvpnwidget.cpp    | 146 ++++++++++++++++++++++++++++++-
+ vpn/openvpn/openvpnwidget.h      |   4 +
+ 6 files changed, 279 insertions(+), 4 deletions(-)
+
+diff --git a/vpn/openvpn/CMakeLists.txt b/vpn/openvpn/CMakeLists.txt
+index ba914607d..2a8d96649 100644
+--- a/vpn/openvpn/CMakeLists.txt
++++ b/vpn/openvpn/CMakeLists.txt
+@@ -23,4 +23,11 @@ target_link_libraries(plasmanetworkmanagement_openvpnui
+     KF6::KIOWidgets
+ )
+ 
++# openvpn --show-pkcs11-ids needs a PKCS#11 module, the p11-kit proxy exposes all registered ones
++pkg_get_variable(P11KIT_PROXY_MODULE p11-kit-1 proxy_module)
++if(NOT P11KIT_PROXY_MODULE)
++    set(P11KIT_PROXY_MODULE "${CMAKE_INSTALL_FULL_LIBDIR}/p11-kit-proxy.so")
++endif()
++target_compile_definitions(plasmanetworkmanagement_openvpnui PRIVATE P11KIT_PROXY_MODULE="${P11KIT_PROXY_MODULE}")
++
+ install(TARGETS plasmanetworkmanagement_openvpnui  DESTINATION ${KDE_INSTALL_PLUGINDIR}/plasma/network/vpn)
+diff --git a/vpn/openvpn/nm-openvpn-service.h b/vpn/openvpn/nm-openvpn-service.h
+index ab81629dc..00d9f851e 100644
+--- a/vpn/openvpn/nm-openvpn-service.h
++++ b/vpn/openvpn/nm-openvpn-service.h
+@@ -39,6 +39,7 @@
+ #define NM_OPENVPN_KEY_HTTP_PROXY_USERNAME "http-proxy-username"
+ #define NM_OPENVPN_KEY_KEY "key"
+ #define NM_OPENVPN_KEY_KEYSIZE "keysize"
++#define NM_OPENVPN_KEY_PKCS11_ID "pkcs11-id"
+ #define NM_OPENVPN_KEY_LOCAL_IP "local-ip" /* ??? */
+ #define NM_OPENVPN_KEY_MAX_ROUTES "max-routes"
+ #define NM_OPENVPN_KEY_MSSFIX "mssfix"
+@@ -110,6 +111,7 @@
+ #define NM_OPENVPN_CONTYPE_PASSWORD_TLS "password-tls"
+ #define NM_OPENVPN_CONTYPE_STATIC_KEY "static-key"
+ #define NM_OPENVPN_CONTYPE_TLS "tls"
++#define NM_OPENVPN_CONTYPE_PKCS11 "pkcs11"
+ 
+ /* arguments of "--remote-cert-tls" */
+ #define NM_OPENVPN_REM_CERT_TLS_CLIENT "client"
+diff --git a/vpn/openvpn/openvpn.ui b/vpn/openvpn/openvpn.ui
+index 82445480b..6fd175b56 100644
+--- a/vpn/openvpn/openvpn.ui
++++ b/vpn/openvpn/openvpn.ui
+@@ -87,6 +87,11 @@ You can specify multiple hosts for redundancy (use commas or spaces as delimiter
+          <string>Password with Certificates (TLS)</string>
+         </property>
+        </item>
++       <item>
++        <property name="text">
++         <string>Certificates on Smart Card (PKCS#11)</string>
++        </property>
++       </item>
+       </widget>
+      </item>
+     </layout>
+@@ -620,6 +625,105 @@ You can specify multiple hosts for redundancy (use commas or spaces as delimiter
+        </item>
+       </layout>
+      </widget>
++     <widget class="QWidget" name="page_5">
++      <layout class="QFormLayout" name="formLayout_pkcs11">
++       <item row="0" column="0">
++        <widget class="QLabel" name="labelPkcs11CaFile">
++         <property name="text">
++          <string>CA Certificate:</string>
++         </property>
++         <property name="buddy">
++          <cstring>pkcs11CaFile</cstring>
++         </property>
++        </widget>
++       </item>
++       <item row="0" column="1">
++        <widget class="KUrlRequester" name="pkcs11CaFile">
++         <property name="toolTip">
++          <string>Certificate authority (CA) file in .pem format.</string>
++         </property>
++         <property name="nameFilters">
++          <StringList>
++           <string notr="true">*.pem *.crt *.key *.cer *.p12</string>
++          </StringList>
++         </property>
++        </widget>
++       </item>
++       <item row="1" column="0">
++        <widget class="QLabel" name="labelPkcs11Id">
++         <property name="text">
++          <string>Certificate:</string>
++         </property>
++         <property name="buddy">
++          <cstring>pkcs11Id</cstring>
++         </property>
++        </widget>
++       </item>
++       <item row="1" column="1">
++        <layout class="QHBoxLayout" name="horizontalLayoutPkcs11Id">
++         <item>
++          <widget class="QComboBox" name="pkcs11Id">
++           <property name="sizePolicy">
++            <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
++             <horstretch>0</horstretch>
++             <verstretch>0</verstretch>
++            </sizepolicy>
++           </property>
++           <property name="editable">
++            <bool>true</bool>
++           </property>
++           <property name="toolTip">
++            <string>PKCS#11 certificate ID (--pkcs11-id). Plug in the smart card and press Detect to choose from the available certificates.</string>
++           </property>
++          </widget>
++         </item>
++         <item>
++          <widget class="QPushButton" name="btnPkcs11Detect">
++           <property name="text">
++            <string>Detect</string>
++           </property>
++           <property name="toolTip">
++            <string>List certificates on the plugged in smart cards and tokens.</string>
++           </property>
++          </widget>
++         </item>
++        </layout>
++       </item>
++       <item row="2" column="0">
++        <widget class="QLabel" name="labelPkcs11Pin">
++         <property name="text">
++          <string>PIN:</string>
++         </property>
++         <property name="buddy">
++          <cstring>pkcs11Pin</cstring>
++         </property>
++        </widget>
++       </item>
++       <item row="2" column="1">
++        <widget class="PasswordField" name="pkcs11Pin">
++         <property name="toolTip">
++          <string>Smart card PIN.</string>
++         </property>
++         <property name="passwordModeEnabled" stdset="0">
++          <bool>true</bool>
++         </property>
++        </widget>
++       </item>
++       <item row="3" column="0" colspan="2">
++        <spacer name="verticalSpacer_pkcs11">
++         <property name="orientation">
++          <enum>Qt::Vertical</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>20</width>
++           <height>0</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
+     </widget>
+    </item>
+    <item>
+@@ -681,6 +785,10 @@ You can specify multiple hosts for redundancy (use commas or spaces as delimiter
+   <tabstop>x509PassKeyPassword</tabstop>
+   <tabstop>x509PassUsername</tabstop>
+   <tabstop>x509PassPassword</tabstop>
++  <tabstop>pkcs11CaFile</tabstop>
++  <tabstop>pkcs11Id</tabstop>
++  <tabstop>btnPkcs11Detect</tabstop>
++  <tabstop>pkcs11Pin</tabstop>
+  </tabstops>
+  <resources/>
+  <connections>
+diff --git a/vpn/openvpn/openvpnauth.cpp b/vpn/openvpn/openvpnauth.cpp
+index a954eebf1..92f1a7d6d 100644
+--- a/vpn/openvpn/openvpnauth.cpp
++++ b/vpn/openvpn/openvpnauth.cpp
+@@ -77,8 +77,17 @@ void OpenVpnAuthWidget::readSecrets()
+             }
+         }
+ 
++        // For PKCS#11 connections "cert-pass" is the smart card PIN. Never show
++        // it in clear text, even though the prompt may mention a "token".
++        const bool isPin = cType == QLatin1String(NM_OPENVPN_CONTYPE_PKCS11) && passwordType == QLatin1String(NM_OPENVPN_KEY_CERTPASS);
++        if (isPin) {
++            passwordModeEnabled = true;
++        }
++
+         if (prompt.isEmpty()) {
+-            if (passwordType == QLatin1String(NM_OPENVPN_KEY_CERTPASS)) {
++            if (isPin) {
++                prompt = i18n("PIN:");
++            } else if (passwordType == QLatin1String(NM_OPENVPN_KEY_CERTPASS)) {
+                 prompt = i18n("Key Password:");
+             } else if (passwordType == QLatin1String(NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD)) {
+                 prompt = i18n("Proxy Password:");
+@@ -115,6 +124,11 @@ void OpenVpnAuthWidget::readSecrets()
+             }
+         } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PASSWORD)) {
+             addPasswordField(i18n("Password:"), secrets.value(QStringLiteral(NM_OPENVPN_KEY_PASSWORD)), QLatin1String(NM_OPENVPN_KEY_PASSWORD));
++        } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PKCS11)) {
++            // Smart card PIN
++            if (!certType.testFlag(NetworkManager::Setting::NotRequired)) {
++                addPasswordField(i18n("PIN:"), secrets.value(QStringLiteral(NM_OPENVPN_KEY_CERTPASS)), QLatin1String(NM_OPENVPN_KEY_CERTPASS));
++            }
+         }
+ 
+         if (dataMap.contains(NM_OPENVPN_KEY_PROXY_SERVER) && !proxyType.testFlag(NetworkManager::Setting::NotRequired)) {
+diff --git a/vpn/openvpn/openvpnwidget.cpp b/vpn/openvpn/openvpnwidget.cpp
+index 9cce04968..28940477f 100644
+--- a/vpn/openvpn/openvpnwidget.cpp
++++ b/vpn/openvpn/openvpnwidget.cpp
+@@ -12,6 +12,8 @@
+ #include <QDBusMetaType>
+ #include <QLineEdit>
+ #include <QPointer>
++#include <QRegularExpression>
++#include <QStandardPaths>
+ #include <QUrl>
+ 
+ #include <KProcess>
+@@ -24,6 +26,7 @@ class OpenVpnSettingWidget::Private
+ public:
+     Ui_OpenVPNProp ui;
+     NetworkManager::VpnSetting::Ptr setting;
++    QProcess *pkcs11Process = nullptr;
+     class EnumConnectionType
+     {
+     public:
+@@ -31,7 +34,8 @@ public:
+             Certificates = 0,
+             Psk,
+             Password,
+-            CertsPassword
++            CertsPassword,
++            Pkcs11
+         };
+     };
+     class EnumKeyDirection
+@@ -62,6 +66,10 @@ OpenVpnSettingWidget::OpenVpnSettingWidget(const NetworkManager::VpnSetting::Ptr
+     d->ui.x509PassKeyPassword->setPasswordNotRequiredEnabled(true);
+     d->ui.x509PassPassword->setPasswordOptionsEnabled(true);
+     d->ui.x509PassPassword->setPasswordNotRequiredEnabled(true);
++    d->ui.pkcs11Pin->setPasswordOptionsEnabled(true);
++    d->ui.pkcs11Pin->setPasswordNotRequiredEnabled(true);
++    // the PIN is asked when the token is used, don't store it by default
++    d->ui.pkcs11Pin->setPasswordOption(PasswordField::AlwaysAsk);
+ 
+     // use requesters' urlSelected signals to set other requester's startDirs to save clicking
+     // around the filesystem
+@@ -74,18 +82,22 @@ OpenVpnSettingWidget::OpenVpnSettingWidget(const NetworkManager::VpnSetting::Ptr
+         d->ui.x509PassCaFile,
+         d->ui.x509PassCert,
+         d->ui.x509PassKey,
++        d->ui.pkcs11CaFile,
+     };
+     for (const KUrlRequester *requester : requesters) {
+         connect(requester, &KUrlRequester::urlSelected, this, &OpenVpnSettingWidget::updateStartDir);
+     }
+ 
+     connect(d->ui.btnAdvanced, &QPushButton::clicked, this, &OpenVpnSettingWidget::showAdvanced);
++    connect(d->ui.btnPkcs11Detect, &QPushButton::clicked, this, &OpenVpnSettingWidget::detectPkcs11Ids);
+ 
+     // Connect for setting check
+     watchChangedSetting();
+ 
+     // Connect for validity check
+     connect(d->ui.gateway, &QLineEdit::textChanged, this, &OpenVpnSettingWidget::slotWidgetChanged);
++    connect(d->ui.cmbConnectionType, &QComboBox::currentIndexChanged, this, &OpenVpnSettingWidget::slotWidgetChanged);
++    connect(d->ui.pkcs11Id, &QComboBox::currentTextChanged, this, &OpenVpnSettingWidget::slotWidgetChanged);
+ 
+     KAcceleratorManager::manage(this);
+ 
+@@ -139,6 +151,12 @@ void OpenVpnSettingWidget::loadConfig(const NetworkManager::Setting::Ptr &settin
+         d->ui.x509CaFile->setUrl(QUrl::fromLocalFile(dataMap[NM_OPENVPN_KEY_CA]));
+         d->ui.x509Cert->setUrl(QUrl::fromLocalFile(dataMap[NM_OPENVPN_KEY_CERT]));
+         d->ui.x509Key->setUrl(QUrl::fromLocalFile(dataMap[NM_OPENVPN_KEY_KEY]));
++    } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PKCS11)) {
++        d->ui.cmbConnectionType->setCurrentIndex(Private::EnumConnectionType::Pkcs11);
++        if (dataMap.contains(NM_OPENVPN_KEY_CA)) {
++            d->ui.pkcs11CaFile->setUrl(QUrl::fromLocalFile(dataMap[NM_OPENVPN_KEY_CA]));
++        }
++        setPkcs11Id(dataMap[NM_OPENVPN_KEY_PKCS11_ID]);
+     }
+ 
+     d->ui.gateway->setText(dataMap[NM_OPENVPN_KEY_REMOTE]);
+@@ -156,6 +174,9 @@ void OpenVpnSettingWidget::loadConfig(const NetworkManager::Setting::Ptr &settin
+         fillOnePasswordCombo(d->ui.x509PassPassword, type);
+         type = (NetworkManager::Setting::SecretFlags)dataMap[NM_OPENVPN_KEY_CERTPASS "-flags"].toInt();
+         fillOnePasswordCombo(d->ui.x509PassKeyPassword, type);
++    } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PKCS11)) {
++        type = (NetworkManager::Setting::SecretFlags)dataMap[NM_OPENVPN_KEY_CERTPASS "-flags"].toInt();
++        fillOnePasswordCombo(d->ui.pkcs11Pin, type);
+     }
+ 
+     loadSecrets(setting);
+@@ -176,6 +197,8 @@ void OpenVpnSettingWidget::loadSecrets(const NetworkManager::Setting::Ptr &setti
+         } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
+             d->ui.x509PassPassword->setText(secrets.value(NM_OPENVPN_KEY_PASSWORD));
+             d->ui.x509PassKeyPassword->setText(secrets.value(NM_OPENVPN_KEY_CERTPASS));
++        } else if (cType == QLatin1String(NM_OPENVPN_CONTYPE_PKCS11)) {
++            d->ui.pkcs11Pin->setText(secrets.value(NM_OPENVPN_KEY_CERTPASS));
+         }
+     }
+ }
+@@ -270,6 +293,25 @@ QVariantMap OpenVpnSettingWidget::setting() const
+         }
+         handleOnePasswordType(d->ui.x509PassPassword, QLatin1String(NM_OPENVPN_KEY_PASSWORD "-flags"), data);
+         break;
++    case Private::EnumConnectionType::Pkcs11:
++        contype = QLatin1String(NM_OPENVPN_CONTYPE_PKCS11);
++        if (!d->ui.pkcs11CaFile->url().isEmpty()) {
++            data.insert(QLatin1String(NM_OPENVPN_KEY_CA), d->ui.pkcs11CaFile->url().toLocalFile());
++        } else {
++            data.remove(QLatin1String(NM_OPENVPN_KEY_CA));
++        }
++        data.insert(QLatin1String(NM_OPENVPN_KEY_PKCS11_ID), pkcs11Id());
++        // the certificate and the key are on the token
++        data.remove(QLatin1String(NM_OPENVPN_KEY_CERT));
++        data.remove(QLatin1String(NM_OPENVPN_KEY_KEY));
++        // PIN
++        if (!d->ui.pkcs11Pin->text().isEmpty()) {
++            secretData.insert(QLatin1String(NM_OPENVPN_KEY_CERTPASS), d->ui.pkcs11Pin->text());
++        } else {
++            secretData.remove(QLatin1String(NM_OPENVPN_KEY_CERTPASS));
++        }
++        handleOnePasswordType(d->ui.pkcs11Pin, QLatin1String(NM_OPENVPN_KEY_CERTPASS "-flags"), data);
++        break;
+     }
+     data.insert(QLatin1String(NM_OPENVPN_KEY_CONNECTION_TYPE), contype);
+ 
+@@ -283,7 +325,7 @@ void OpenVpnSettingWidget::updateStartDir(const QUrl &url)
+ {
+     QList<KUrlRequester *> requesters;
+     requesters << d->ui.x509CaFile << d->ui.x509Cert << d->ui.x509Key << d->ui.pskSharedKey << d->ui.passCaFile << d->ui.x509PassCaFile << d->ui.x509PassCert
+-               << d->ui.x509PassKey;
++               << d->ui.x509PassKey << d->ui.pkcs11CaFile;
+     for (KUrlRequester *requester : std::as_const(requesters)) {
+         requester->setStartDir(url.adjusted(QUrl::RemoveFilename | QUrl::StripTrailingSlash));
+     }
+@@ -344,7 +386,105 @@ void OpenVpnSettingWidget::showAdvanced()
+ 
+ bool OpenVpnSettingWidget::isValid() const
+ {
+-    return !d->ui.gateway->text().isEmpty();
++    if (d->ui.gateway->text().isEmpty()) {
++        return false;
++    }
++    if (d->ui.cmbConnectionType->currentIndex() == Private::EnumConnectionType::Pkcs11) {
++        return !pkcs11Id().isEmpty();
++    }
++    return true;
++}
++
++QString OpenVpnSettingWidget::pkcs11Id() const
++{
++    // detected entries show a friendly name and keep the ID as item data
++    const int index = d->ui.pkcs11Id->findText(d->ui.pkcs11Id->currentText());
++    if (index >= 0 && !d->ui.pkcs11Id->itemData(index).toString().isEmpty()) {
++        return d->ui.pkcs11Id->itemData(index).toString();
++    }
++    return d->ui.pkcs11Id->currentText().trimmed();
++}
++
++void OpenVpnSettingWidget::setPkcs11Id(const QString &id)
++{
++    const int index = d->ui.pkcs11Id->findData(id);
++    if (index >= 0) {
++        d->ui.pkcs11Id->setCurrentIndex(index);
++    } else {
++        d->ui.pkcs11Id->setEditText(id);
++    }
++}
++
++void OpenVpnSettingWidget::detectPkcs11Ids()
++{
++    if (d->pkcs11Process) {
++        return;
++    }
++
++    const QString openvpn = QStandardPaths::findExecutable(QStringLiteral("openvpn"), {QStringLiteral("/usr/sbin"), QStringLiteral("/sbin")});
++    const QString binary = openvpn.isEmpty() ? QStandardPaths::findExecutable(QStringLiteral("openvpn")) : openvpn;
++    if (binary.isEmpty()) {
++        d->ui.pkcs11Id->setToolTip(i18n("OpenVPN executable not found."));
++        return;
++    }
++
++    d->ui.btnPkcs11Detect->setEnabled(false);
++    d->pkcs11Process = new QProcess(this);
++    d->pkcs11Process->setProcessChannelMode(QProcess::MergedChannels);
++    connect(d->pkcs11Process, &QProcess::finished, this, &OpenVpnSettingWidget::pkcs11DetectFinished);
++    d->pkcs11Process->start(binary, {QStringLiteral("--show-pkcs11-ids"), QStringLiteral(P11KIT_PROXY_MODULE)});
++}
++
++void OpenVpnSettingWidget::pkcs11DetectFinished(int exitCode, QProcess::ExitStatus exitStatus)
++{
++    const QString output = QString::fromLocal8Bit(d->pkcs11Process->readAll());
++    d->pkcs11Process->deleteLater();
++    d->pkcs11Process = nullptr;
++    d->ui.btnPkcs11Detect->setEnabled(true);
++
++    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
++        qCWarning(PLASMA_NM_OPENVPN_LOG) << "openvpn --show-pkcs11-ids failed:" << output;
++    }
++
++    // Each certificate is printed as a block of "Key: value" lines,
++    // the one to use is "Serialized id:".
++    const QString current = pkcs11Id();
++    QString dn;
++    QString friendlyName;
++    QList<QPair<QString, QString>> found;
++    static const QRegularExpression lineRe(QStringLiteral("^\\s*([A-Za-z ]+):\\s*(.*)$"));
++    const QStringList lines = output.split(QLatin1Char('\n'));
++    for (const QString &line : lines) {
++        const QRegularExpressionMatch m = lineRe.match(line);
++        if (!m.hasMatch()) {
++            continue;
++        }
++        const QString key = m.captured(1).trimmed();
++        const QString value = m.captured(2).trimmed();
++        if (key == QLatin1String("DN")) {
++            dn = value;
++        } else if (key == QLatin1String("Friendly name")) {
++            friendlyName = value;
++        } else if (key == QLatin1String("Serialized id")) {
++            const QString label = !friendlyName.isEmpty() ? friendlyName : (!dn.isEmpty() ? dn : value);
++            found.append({label, value});
++            dn.clear();
++            friendlyName.clear();
++        }
++    }
++
++    d->ui.pkcs11Id->clear();
++    for (const auto &[label, id] : std::as_const(found)) {
++        d->ui.pkcs11Id->addItem(label, id);
++        d->ui.pkcs11Id->setItemData(d->ui.pkcs11Id->count() - 1, id, Qt::ToolTipRole);
++    }
++    if (found.isEmpty()) {
++        d->ui.pkcs11Id->setToolTip(i18n("No certificates found. Is the smart card plugged in?"));
++    }
++    if (!current.isEmpty()) {
++        setPkcs11Id(current);
++    }
++    slotWidgetChanged();
+ }
+ 
+ #include "moc_openvpnwidget.cpp"
+diff --git a/vpn/openvpn/openvpnwidget.h b/vpn/openvpn/openvpnwidget.h
+index 4df1e2327..85f8b4533 100644
+--- a/vpn/openvpn/openvpnwidget.h
++++ b/vpn/openvpn/openvpnwidget.h
+@@ -36,6 +36,8 @@ public:
+ private Q_SLOTS:
+     void updateStartDir(const QUrl &);
+     void showAdvanced();
++    void detectPkcs11Ids();
++    void pkcs11DetectFinished(int exitCode, QProcess::ExitStatus exitStatus);
+ 
+ private:
+     class Private;
+@@ -43,6 +45,8 @@ private:
+     void setPasswordType(QLineEdit *, int);
+     void fillOnePasswordCombo(PasswordField *, NetworkManager::Setting::SecretFlags);
+     void handleOnePasswordType(const PasswordField *, const QString &, NMStringMap &) const;
++    QString pkcs11Id() const;
++    void setPkcs11Id(const QString &id);
+ };
+ 
+ #endif // OPENVPNWIDGET_H

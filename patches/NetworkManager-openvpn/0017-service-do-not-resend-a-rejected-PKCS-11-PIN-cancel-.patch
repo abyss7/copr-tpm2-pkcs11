@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Lezhankin <abyss.7@gmail.com>
+Date: Sat, 19 Sep 2026 13:56:20 +0300
+Subject: [PATCH] service: do not resend a rejected PKCS#11 PIN, cancel token
+ insertion requests
+
+pkcs11-helper asks for the PIN again when the login fails. Resending the
+saved PIN burns the retry counter and quickly locks the token (e.g. a
+YubiKey PIV allows 3 attempts). Send the saved PIN only once and ask the
+user for a new one afterwards.
+
+When the token is not plugged in openvpn waits for a NEED-OK confirmation
+that nobody sends. Cancel it and fail the connection right away.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/nm-openvpn-service.c | 52 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index a8ac80a..c8ff368 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -99,6 +99,9 @@ typedef struct {
+ 	char *username;
+ 	char *password;
+ 	char *priv_key_pass;
++	/* The PKCS#11 PIN (priv_key_pass) was already sent once. A new request
++	 * means it was wrong: never resend it, as tokens lock after few attempts. */
++	bool token_pin_sent;
+ 	char *proxy_username;
+ 	char *proxy_password;
+ 	char *pending_auth;
+@@ -1054,24 +1057,46 @@ handle_auth (NMOpenvpnPluginIOData *io_data,
+ 			}
+ 		}
+ 		handled = TRUE;
+-	} else if (nm_streq (requested_auth, "Private Key") || g_str_has_suffix (requested_auth, " token")) {
++	} else if (g_str_has_suffix (requested_auth, " token")) {
++		if (io_data->token_pin_sent && io_data->priv_key_pass) {
++			memset (io_data->priv_key_pass, 0, strlen (io_data->priv_key_pass));
++			g_clear_pointer (&io_data->priv_key_pass, g_free);
++		}
+ 		if (io_data->priv_key_pass) {
+ 			char *qpass, *buf;
+ 
+-			/* Quote strings passed back to openvpn */
+ 			qpass = ovpn_quote_string (io_data->priv_key_pass);
+ 			buf = g_strdup_printf ("password \"%s\" \"%s\"\n", requested_auth, qpass);
+ 			memset (qpass, 0, strlen (qpass));
+ 			g_free (qpass);
+ 
+-			/* Will always write everything in blocking channels (on success) */
+ 			g_io_channel_write_chars (io_data->socket_channel, buf, strlen (buf), NULL, NULL);
+ 			g_io_channel_flush (io_data->socket_channel, NULL);
++			memset (buf, 0, strlen (buf));
+ 			g_free (buf);
+-		} else if (g_str_has_suffix (requested_auth, " token")) {
++			io_data->token_pin_sent = TRUE;
++		} else {
+ 			hints = g_new0 (const char *, 2);
+ 			hints[i++] = NM_OPENVPN_KEY_CERTPASS;
+-			*out_message = _("Password.");
++			*out_message = io_data->token_pin_sent
++			               ? _("The PIN was not accepted. Enter the smart card PIN.")
++			               : _("The smart card PIN is required.");
++		}
++		handled = TRUE;
++	} else if (nm_streq (requested_auth, "Private Key")) {
++		if (io_data->priv_key_pass) {
++			char *qpass, *buf;
++
++			/* Quote strings passed back to openvpn */
++			qpass = ovpn_quote_string (io_data->priv_key_pass);
++			buf = g_strdup_printf ("password \"%s\" \"%s\"\n", requested_auth, qpass);
++			memset (qpass, 0, strlen (qpass));
++			g_free (qpass);
++
++			/* Will always write everything in blocking channels (on success) */
++			g_io_channel_write_chars (io_data->socket_channel, buf, strlen (buf), NULL, NULL);
++			g_io_channel_flush (io_data->socket_channel, NULL);
++			g_free (buf);
+ 		} else {
+ 			hints = g_new0 (const char *, 2);
+ 			hints[i++] = NM_OPENVPN_KEY_CERTPASS;
+@@ -1210,6 +1235,21 @@ handle_management_socket (NMOpenvpnPlugin *plugin,
+ 		g_free (auth);
+ 	}
+ 
++	/* pkcs11-helper asks for the token when it is not plugged in, e.g.
++	 * ">NEED-OK:Need 'token-insertion-request' confirmation MSG:Please insert <label> token".
++	 * Nobody would confirm it and openvpn would wait until the connect timeout. */
++	auth = get_detail (str, ">NEED-OK:Need '");
++	if (auth) {
++		gs_free char *buf = g_strdup_printf ("needok \"%s\" cancel\n", auth);
++
++		_LOGW ("Cannot confirm '%s' request: %s", auth, str);
++		g_io_channel_write_chars (source, buf, strlen (buf), NULL, NULL);
++		g_io_channel_flush (source, NULL);
++		*out_failure = NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED;
++		again = FALSE;
++		g_free (auth);
++	}
++
+ out:
+ 	g_free (str);
+ 	return again;
+@@ -2411,6 +2451,8 @@ real_new_secrets (NMVpnServicePlugin *base_plugin,
+ 	_LOGD ("VPN received new secrets; sending to management interface");
+ 
+ 	update_io_data_from_vpn_setting (priv->io_data, s_vpn, NULL);
++	/* The user was asked again, so this is a fresh PIN */
++	priv->io_data->token_pin_sent = FALSE;
+ 
+ 	g_warn_if_fail (priv->io_data->pending_auth);
+ 	if (!handle_auth (priv->io_data, priv->io_data->pending_auth, &message, &hints)) {

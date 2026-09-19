@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Thu, 7 May 2026 17:08:10 +0200
+Subject: [PATCH] Add PKCS#11 support
+
+---
+ Makefile.am                           |   1 +
+ auth-dialog/main.c                    |   5 +
+ properties/import-export.c            |  66 ++++++++++--
+ properties/nm-openvpn-dialog.ui       | 124 ++++++++++++++++++++++
+ properties/nm-openvpn-editor.c        | 147 +++++++++++++++++++++++++-
+ properties/tests/conf/pkcs11.ovpn     |  13 +++
+ properties/tests/test-import-export.c |  37 +++++++
+ shared/nm-service-defines.h           |   4 +
+ shared/utils.h                        |   2 +
+ src/nm-openvpn-service.c              |  46 +++++++-
+ 10 files changed, 429 insertions(+), 16 deletions(-)
+ create mode 100644 properties/tests/conf/pkcs11.ovpn
+
+diff --git a/Makefile.am b/Makefile.am
+index 5e23aa4..9467ec3 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -284,6 +284,7 @@ EXTRA_DIST += \
+ 	properties/tests/conf/iso885915.ovpn \
+ 	properties/tests/conf/mtu-disc.ovpn \
+ 	properties/tests/conf/password.conf \
++	properties/tests/conf/pkcs11.ovpn \
+ 	properties/tests/conf/pkcs12.ovpn \
+ 	properties/tests/conf/pkcs12-with-ca.ovpn \
+ 	properties/tests/conf/port.ovpn \
+diff --git a/auth-dialog/main.c b/auth-dialog/main.c
+index f182a22..36c05b9 100644
+--- a/auth-dialog/main.c
++++ b/auth-dialog/main.c
+@@ -453,6 +453,11 @@ get_passwords_required (GHashTable *data,
+ 		nm_vpn_service_plugin_get_secret_flags (data, NM_OPENVPN_KEY_PASSWORD, &flags);
+ 		if (!(flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED))
+ 			*out_need_password = TRUE;
++	} else if (!strcmp (ctype, NM_OPENVPN_CONTYPE_PKCS11)) {
++		flags = NM_SETTING_SECRET_FLAG_NONE;
++		nm_vpn_service_plugin_get_secret_flags (data, NM_OPENVPN_KEY_CERTPASS, &flags);
++		if (!(flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED))
++			*out_need_certpass = TRUE;
+ 	}
+ 
+ 	val = g_hash_table_lookup (data, NM_OPENVPN_KEY_PROXY_SERVER);
+diff --git a/properties/import-export.c b/properties/import-export.c
+index 0f83862..d996b74 100644
+--- a/properties/import-export.c
++++ b/properties/import-export.c
+@@ -794,7 +794,7 @@ do_import (const char *path, const char *contents, gsize contents_len, GError **
+ 	char *tmp, *tmp2;
+ 	const char *ta_direction = NULL, *secret_direction = NULL;
+ 	gboolean allow_ta_direction = FALSE, allow_secret_direction = FALSE;
+-	gboolean have_cert = FALSE, have_key = FALSE, have_ca = FALSE, have_pkcs12 = FALSE;
++	gboolean have_cert = FALSE, have_key = FALSE, have_ca = FALSE, have_pkcs12 = FALSE, have_pkcs11 = FALSE;
+ 	const char *cert_path = NULL, *key_path = NULL, *ca_path = NULL;
+ 	GSList *inline_blobs = NULL;
+ 	GSList *sl_iter;
+@@ -1535,6 +1535,26 @@ do_import (const char *path, const char *contents, gsize contents_len, GError **
+ 			nm_ip_route_unref (route);
+ 		}
+ 
++		if (NM_IN_STRSET (params[0], NMV_OVPN_TAG_PKCS11_ID)) {
++			if (!args_params_check_nargs_n (params, 1, &line_error))
++				goto handle_line_error;
++			if (!args_params_check_arg_utf8 (params, 1, NULL, &line_error))
++				goto handle_line_error;
++			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, params[1]);
++			have_pkcs11 = TRUE;
++			continue;
++		}
++
++		if (NM_IN_STRSET (params[0], NMV_OVPN_TAG_PKCS11_PROVIDERS)) {
++			if (!args_params_check_nargs_n (params, 1, &line_error))
++				goto handle_line_error;
++			if (!args_params_check_arg_utf8 (params, 1, NULL, &line_error))
++				goto handle_line_error;
++			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, params[1]);
++			have_pkcs11 = TRUE;
++			continue;
++		}
++
+ 		if (params[0][0] == '<' && params[0][strlen (params[0]) - 1] == '>') {
+ 			gs_free char *token = g_strndup (&params[0][1], strlen (params[0]) - 2);
+ 			gs_free char *end_token = NULL;
+@@ -1748,15 +1768,18 @@ handle_line_error:
+ 	}
+ 
+ 	/* Determine connection type */
+-	if (have_pass) {
++	if (have_pkcs11) {
++		ctype = NM_OPENVPN_CONTYPE_PKCS11;
++	} else if (have_pass) {
+ 		if (have_cert || have_pkcs12)
+ 			ctype = NM_OPENVPN_CONTYPE_PASSWORD_TLS;
+ 		else if (have_ca)
+ 			ctype = NM_OPENVPN_CONTYPE_PASSWORD;
+ 	} else if (have_cert || have_pkcs12) {
+ 		ctype = NM_OPENVPN_CONTYPE_TLS;
+-	} else if (have_sk)
++	} else if (have_sk) {
+ 		ctype = NM_OPENVPN_CONTYPE_STATIC_KEY;
++	}
+ 
+ 	if (!ctype)
+ 		ctype = NM_OPENVPN_CONTYPE_TLS;
+@@ -1819,6 +1842,14 @@ handle_line_error:
+ 		}
+ 		inline_blobs = tmp_list;
+ 	}
++	if (have_pkcs11) {
++		/* If there should be a private key password, default it to
++		 * being agent-owned. */
++		nm_setting_set_secret_flags (NM_SETTING (s_vpn),
++		                             NM_OPENVPN_KEY_CERTPASS,
++		                             NM_SETTING_SECRET_FLAG_AGENT_OWNED,
++		                             NULL);
++	}
+ 
+ 	for (sl_iter = inline_blobs; sl_iter; sl_iter = sl_iter->next) {
+ 		if (!inline_blob_write_out (sl_iter->data, error))
+@@ -2025,7 +2056,8 @@ do_export_create (NMConnection *connection, const char *path, GError **error)
+ 
+ 	if (NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
+ 	                                   NM_OPENVPN_CONTYPE_PASSWORD,
+-	                                   NM_OPENVPN_CONTYPE_PASSWORD_TLS))
++	                                   NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++	                                   NM_OPENVPN_CONTYPE_PKCS11))
+ 		args_write_line (f, NMV_OVPN_TAG_CLIENT);
+ 
+ 	/* 'remote' */
+@@ -2072,7 +2104,8 @@ do_export_create (NMConnection *connection, const char *path, GError **error)
+ 
+ 		if (NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
+ 		                                   NM_OPENVPN_CONTYPE_PASSWORD,
+-		                                   NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
++		                                   NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++		                                   NM_OPENVPN_CONTYPE_PKCS11)) {
+ 			value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_CA);
+ 			if (nmovpn_arg_is_set (value))
+ 				cacert = nm_utils_str_utf8safe_unescape (value, &cacert_free);
+@@ -2122,6 +2155,26 @@ do_export_create (NMConnection *connection, const char *path, GError **error)
+ 		}
+ 	}
+ 
++	if (NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_PKCS11)) {
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
++		if (nmovpn_arg_is_set (value)) {
++			gs_free char *s_free = NULL;
++
++			args_write_line (f,
++			                 NMV_OVPN_TAG_PKCS11_ID,
++			                 nm_utils_str_utf8safe_unescape (value, &s_free));
++		}
++
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++		if (nmovpn_arg_is_set (value)) {
++			gs_free char *s_free = NULL;
++
++			args_write_line (f,
++			                 NMV_OVPN_TAG_PKCS11_PROVIDERS,
++			                 nm_utils_str_utf8safe_unescape (value, &s_free));
++		}
++	}
++
+ 	args_write_line_setting_value_int (f, NMV_OVPN_TAG_RENEG_SEC, s_vpn, NM_OPENVPN_KEY_RENEG_SECONDS);
+ 
+ 	args_write_line_setting_value_int (f, NMV_OVPN_TAG_MAX_ROUTES, s_vpn, NM_OPENVPN_KEY_MAX_ROUTES);
+@@ -2220,7 +2273,8 @@ do_export_create (NMConnection *connection, const char *path, GError **error)
+ 	                  /* TLS-Auth/Crypt might be used in the control channel even outside
+ 	                   * of the SSL/TLS mode. */
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD,
+-	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS)) {
++	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++	                  NM_OPENVPN_CONTYPE_PKCS11)) {
+ 		const char *x509_name, *key;
+ 
+ 		args_write_line_setting_value (f, NMV_OVPN_TAG_REMOTE_CERT_TLS, s_vpn, NM_OPENVPN_KEY_REMOTE_CERT_TLS);
+diff --git a/properties/nm-openvpn-dialog.ui b/properties/nm-openvpn-dialog.ui
+index 3136669..8778255 100644
+--- a/properties/nm-openvpn-dialog.ui
++++ b/properties/nm-openvpn-dialog.ui
+@@ -695,6 +695,130 @@ config: static &lt;file&gt; [direction]</property>
+                     <property name="tab_fill">False</property>
+                   </packing>
+                 </child>
++                <child>
++                  <object class="GtkBox" id="pkcs11">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="valign">start</property>
++                    <property name="orientation">vertical</property>
++                    <property name="spacing">6</property>
++                    <child>
++                      <object class="NMACertChooser" id="pkcs11_ca_cert">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="title" translatable="yes">CA</property>
++                        <property name="flags">5</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="GtkGrid">
++                        <property name="visible">True</property>
++                        <property name="can_focus">False</property>
++                        <property name="row_spacing">6</property>
++                        <property name="column_spacing">6</property>
++                        <child>
++                          <object class="GtkLabel" id="label29">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">PKCS#11 Providers</property>
++                            <property name="xalign">1</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">0</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label30">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">PKCS#11 ID</property>
++                            <property name="xalign">1</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">1</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label26">
++                            <property name="visible">True</property>
++                            <property name="can_focus">False</property>
++                            <property name="label" translatable="yes">PKCS#11 PIN</property>
++                            <property name="xalign">1</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">0</property>
++                            <property name="top_attach">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pkcs11_providers">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text" translatable="yes">Path(s) to PKCS#11 provider libraries to load. Multiple providers may be specified if supported. These libraries enable OpenVPN to access cryptographic tokens such as smart cards or HSMs.
++config: pkcs11-providers</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">0</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pkcs11_id">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text" translatable="yes">Identifier of the PKCS#11 object (typically a certificate or key) to be used for authentication. This value is passed to OpenVPN to select the token object.
++config: pkcs11-id</property>
++                            <property name="hexpand">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">1</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="pkcs11_pin">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="tooltip_text" translatable="yes">PIN code used to unlock the PKCS#11 token when prompted by OpenVPN. If omitted, OpenVPN will request it interactively when needed.</property>
++                            <property name="hexpand">True</property>
++                            <property name="visibility">False</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="top_attach">2</property>
++                            <property name="width">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">True</property>
++                        <property name="position">1</property>
++                      </packing>
++                    </child>
++                  </object>
++                </child>
++                <child type="tab">
++                  <object class="GtkLabel" id="label23">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="label">page 5</property>
++                  </object>
++                  <packing>
++                    <property name="position">4</property>
++                    <property name="tab_fill">False</property>
++                  </packing>
++                </child>
+               </object>
+               <packing>
+                 <property name="left_attach">0</property>
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index 0f86b7c..1662715 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -231,6 +231,51 @@ tls_setup (GtkBuilder *builder,
+ 	g_signal_connect_object (cert, "changed", G_CALLBACK (tls_cert_changed_cb), ca_chooser, 0);
+ }
+ 
++static void
++pkcs11_setup (GtkBuilder *builder,
++              NMSettingVpn *s_vpn,
++              ChangedCallback changed_cb,
++              gpointer user_data)
++{
++	NMACertChooser *cert;
++	GtkWidget *widget;
++	const char *value;
++
++	cert = NMA_CERT_CHOOSER (gtk_builder_get_object (builder, "pkcs11_ca_cert"));
++
++	nma_cert_chooser_add_to_size_group (cert, GTK_SIZE_GROUP (gtk_builder_get_object (builder, "labels")));
++	g_signal_connect (G_OBJECT (cert), "changed", G_CALLBACK (changed_cb), user_data);
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id"));
++	if (s_vpn) {
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
++		if (value && *value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_providers"));
++	if (s_vpn) {
++		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++		if (value && *value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_pin"));
++	g_signal_connect (widget, "changed", G_CALLBACK (changed_cb), user_data);
++
++	if (s_vpn) {
++		value = nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS);
++		if (value)
++			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++	}
++
++	nma_utils_setup_password_storage (widget, NM_SETTING_SECRET_FLAG_AGENT_OWNED,
++	                                  (NMSetting *) s_vpn, NM_OPENVPN_KEY_CERTPASS,
++	                                  FALSE, FALSE);
++}
++
+ static void
+ pw_setup (GtkBuilder *builder,
+           NMSettingVpn *s_vpn,
+@@ -279,7 +324,7 @@ tls_pw_init_auth_widget (GtkBuilder *builder,
+ 	NMACertChooser *ca;
+ 	const char *value;
+ 	char namebuf[150];
+-	gboolean tls = FALSE, pw = FALSE;
++	gboolean tls = FALSE, pw = FALSE, pkcs11 = FALSE;
+ 
+ 	g_return_if_fail (builder != NULL);
+ 	g_return_if_fail (changed_cb != NULL);
+@@ -289,11 +334,13 @@ tls_pw_init_auth_widget (GtkBuilder *builder,
+ 	ca = NMA_CERT_CHOOSER (gtk_builder_get_object (builder, namebuf));
+ 	nma_cert_chooser_add_to_size_group (ca, GTK_SIZE_GROUP (gtk_builder_get_object (builder, "labels")));
+ 
+-	/* Three major connection types here: TLS-only, PW-only, and TLS + PW */
++	/* Four major connection types here: TLS-only, PW-only, TLS + PW and PKCS11 + TLS */
+ 	if (!strcmp (contype, NM_OPENVPN_CONTYPE_TLS) || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS))
+ 		tls = TRUE;
+ 	if (!strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD) || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS))
+ 		pw = TRUE;
++	if (!strcmp (contype, NM_OPENVPN_CONTYPE_PKCS11))
++		pkcs11 = TRUE;
+ 
+ 	g_signal_connect (ca, "changed", G_CALLBACK (changed_cb), user_data);
+ 	if (s_vpn) {
+@@ -307,6 +354,8 @@ tls_pw_init_auth_widget (GtkBuilder *builder,
+ 		tls_setup (builder, s_vpn, prefix, ca, changed_cb, user_data);
+ 	if (pw)
+ 		pw_setup (builder, s_vpn, prefix, changed_cb, user_data);
++	if (pkcs11)
++		pkcs11_setup (builder, s_vpn, changed_cb, user_data);
+ }
+ 
+ static void
+@@ -478,6 +527,37 @@ validate_tls (GtkBuilder *builder, const char *prefix, GError **error)
+ 	return TRUE;
+ }
+ 
++static gboolean
++validate_pkcs11 (GtkBuilder *builder, GError **error)
++{
++	gboolean valid;
++	GError *local = NULL;
++	GtkWidget *widget;
++	const char *str;
++
++	valid = validate_cert_chooser (builder, "pkcs11_ca_cert", &local);
++	if (!valid) {
++		g_set_error (error,
++		             NMV_EDITOR_PLUGIN_ERROR,
++		             NMV_EDITOR_PLUGIN_ERROR_INVALID_PROPERTY,
++		             "%s: %s", NM_OPENVPN_KEY_CA, local->message);
++		g_error_free (local);
++		return FALSE;
++	}
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id"));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (!str || !*str) {
++		g_set_error (error,
++		             NMV_EDITOR_PLUGIN_ERROR,
++		             NMV_EDITOR_PLUGIN_ERROR_INVALID_PROPERTY,
++		             NM_OPENVPN_KEY_PKCS11_ID);
++		return FALSE;
++	}
++
++	return TRUE;
++}
++
+ static gboolean
+ auth_widget_check_validity (GtkBuilder *builder, const char *contype, GError **error)
+ {
+@@ -532,6 +612,9 @@ auth_widget_check_validity (GtkBuilder *builder, const char *contype, GError **e
+ 			             NM_OPENVPN_KEY_REMOTE_IP);
+ 			return FALSE;
+ 		}
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PKCS11)) {
++		if (!validate_pkcs11 (builder, error))
++			return FALSE;
+ 	} else
+ 		g_return_val_if_reached (FALSE);
+ 
+@@ -628,6 +711,41 @@ update_pw (GtkBuilder *builder, const char *prefix, NMSettingVpn *s_vpn)
+ 	nm_setting_set_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_PASSWORD, pw_flags, NULL);
+ }
+ 
++static void
++update_pkcs11 (GtkBuilder *builder, NMSettingVpn *s_vpn)
++{
++	GtkWidget *widget;
++	NMSettingSecretFlags pw_flags;
++	const char *str;
++
++	g_return_if_fail (builder != NULL);
++	g_return_if_fail (s_vpn != NULL);
++
++	update_from_cert_chooser (builder,
++	                          NM_OPENVPN_KEY_CA,
++	                          NULL,
++	                          NULL,
++	                          "pkcs11", "ca_cert", s_vpn);
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id"));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, str);
++
++	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_providers"));
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, str);
++
++	widget = (GtkWidget *) gtk_builder_get_object (builder, "pkcs11_pin");
++	str = gtk_editable_get_text (GTK_EDITABLE (widget));
++	if (str && *str)
++		nm_setting_vpn_add_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS, str);
++
++	pw_flags = nma_utils_menu_to_secret_flags (widget);
++	nm_setting_set_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_CERTPASS, pw_flags, NULL);
++}
++
+ static gboolean
+ auth_widget_update_connection (GtkBuilder *builder,
+                                const char *contype,
+@@ -688,6 +806,8 @@ auth_widget_update_connection (GtkBuilder *builder,
+ 		str = gtk_editable_get_text (GTK_EDITABLE (widget));
+ 		if (str && *str)
+ 			nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_REMOTE_IP, str);
++	} else if (!strcmp (contype, NM_OPENVPN_CONTYPE_PKCS11)) {
++		update_pkcs11 (builder, s_vpn);
+ 	} else
+ 		g_return_val_if_reached (FALSE);
+ 
+@@ -1827,7 +1947,8 @@ advanced_dialog_new (GHashTable *hash, const char *contype)
+ 	if (NM_IN_STRSET (contype,
+ 	                  NM_OPENVPN_CONTYPE_TLS,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS,
+-	                  NM_OPENVPN_CONTYPE_PASSWORD)) {
++	                  NM_OPENVPN_CONTYPE_PASSWORD,
++	                  NM_OPENVPN_CONTYPE_PKCS11)) {
+ 		/* Initialize direction combo */
+ 		combo = GTK_WIDGET (gtk_builder_get_object (builder, "direction_combo"));
+ 		store = gtk_list_store_new (2, G_TYPE_STRING, G_TYPE_INT);
+@@ -2288,7 +2409,8 @@ advanced_dialog_new_hash_from_dialog (GtkWidget *dialog)
+ 	contype = g_object_get_data (G_OBJECT (dialog), "connection-type");
+ 	if (   !strcmp (contype, NM_OPENVPN_CONTYPE_TLS)
+ 	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD_TLS)
+-	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)) {
++	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PASSWORD)
++	    || !strcmp (contype, NM_OPENVPN_CONTYPE_PKCS11)) {
+ 		char *filename;
+ 		GFile *file;
+ 
+@@ -2744,7 +2866,8 @@ init_editor_plugin (OpenvpnEditor *self, NMConnection *connection)
+ 		if (!NM_IN_STRSET (contype, NM_OPENVPN_CONTYPE_TLS,
+ 		                            NM_OPENVPN_CONTYPE_STATIC_KEY,
+ 		                            NM_OPENVPN_CONTYPE_PASSWORD,
+-		                            NM_OPENVPN_CONTYPE_PASSWORD_TLS))
++		                            NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++		                            NM_OPENVPN_CONTYPE_PKCS11))
+ 			contype = NM_OPENVPN_CONTYPE_TLS;
+ 	}
+ 
+@@ -2800,6 +2923,20 @@ init_editor_plugin (OpenvpnEditor *self, NMConnection *connection)
+ 	    && nm_streq (contype, NM_OPENVPN_CONTYPE_STATIC_KEY))
+ 		active = 3;
+ 
++	/* PKCS11 auth widget */
++	tls_pw_init_auth_widget (priv->builder, s_vpn,
++	                         NM_OPENVPN_CONTYPE_PKCS11, "pkcs11",
++	                         stuff_changed_cb, self);
++	gtk_list_store_append (store, &iter);
++	gtk_list_store_set (store, &iter,
++	                    COL_AUTH_NAME, _("PKCS#11 (TLS)"),
++	                    COL_AUTH_PAGE, 4,
++	                    COL_AUTH_TYPE, NM_OPENVPN_CONTYPE_PKCS11,
++	                    -1);
++	if (   active < 0
++	    && nm_streq (contype, NM_OPENVPN_CONTYPE_PKCS11))
++		active = 4;
++
+ 	gtk_combo_box_set_model (GTK_COMBO_BOX (widget), GTK_TREE_MODEL (store));
+ 	g_object_unref (store);
+ 	g_signal_connect (widget, "changed", G_CALLBACK (auth_combo_changed_cb), self);
+diff --git a/properties/tests/conf/pkcs11.ovpn b/properties/tests/conf/pkcs11.ovpn
+new file mode 100644
+index 0000000..627ab57
+--- /dev/null
++++ b/properties/tests/conf/pkcs11.ovpn
+@@ -0,0 +1,13 @@
++client
++dev tun
++ca keys/mine-ca.crt
++tls-auth keys/mine-tls.key
++remote 173.8.149.245 1194
++proto tcp
++persist-key
++persist-tun
++cipher AES-256-GCM
++tls-client
++remote-cert-tls server
++pkcs11-providers /usr/lib/x86_64-linux-gnu/pkcs11/libtpm2_pkcs11.so
++pkcs11-id Infineon/SLB9670/0000000000000000/mytoken/0123456789ABCDEF0123456789ABCDEF
+diff --git a/properties/tests/test-import-export.c b/properties/tests/test-import-export.c
+index bc78916..d52dac0 100644
+--- a/properties/tests/test-import-export.c
++++ b/properties/tests/test-import-export.c
+@@ -646,6 +646,40 @@ test_pkcs12_with_ca_import (void)
+ 	_check_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS, NULL);
+ }
+ 
++static void
++test_pkcs11_import (void)
++{
++	_CREATE_PLUGIN (plugin);
++	gs_unref_object NMConnection *connection = NULL;
++	NMSettingConnection *s_con;
++	NMSettingVpn *s_vpn;
++	const char *expected_id = "pkcs11";
++
++	connection = get_basic_connection (plugin, SRCDIR, "pkcs11.ovpn");
++
++	s_con = _get_setting_connection (connection);
++	g_assert_cmpstr (nm_setting_connection_get_id (s_con), ==, expected_id);
++	g_assert (!nm_setting_connection_get_uuid (s_con));
++
++	s_vpn = _get_setting_vpn (connection);
++
++	_check_item (s_vpn, NM_OPENVPN_KEY_CONNECTION_TYPE, NM_OPENVPN_CONTYPE_PKCS11);
++	_check_item (s_vpn, NM_OPENVPN_KEY_DEV, "tun");
++	_check_item (s_vpn, NM_OPENVPN_KEY_PROTO_TCP, "yes");
++	_check_item (s_vpn, NM_OPENVPN_KEY_REMOTE, "173.8.149.245:1194");
++	_check_item (s_vpn, NM_OPENVPN_KEY_PORT, NULL);
++	_check_item (s_vpn, NM_OPENVPN_KEY_CIPHER, "AES-256-GCM");
++	_check_item (s_vpn, NM_OPENVPN_KEY_REMOTE_IP, NULL);
++	_check_item (s_vpn, NM_OPENVPN_KEY_AUTH, NULL);
++	_check_item (s_vpn, NM_OPENVPN_KEY_CA,   SRCDIR"/keys/mine-ca.crt");
++
++	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, "Infineon/SLB9670/0000000000000000/mytoken/0123456789ABCDEF0123456789ABCDEF");
++	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, "/usr/lib/x86_64-linux-gnu/pkcs11/libtpm2_pkcs11.so");
++
++	_check_secret (s_vpn, NM_OPENVPN_KEY_PASSWORD, NULL);
++	_check_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS, NULL);
++}
++
+ static void
+ test_non_utf8_import (void)
+ {
+@@ -1458,6 +1492,9 @@ int main (int argc, char **argv)
+ 	_add_test_func_simple (test_pkcs12_with_ca_import);
+ 	_add_test_func ("pkcs12-with-ca-export", test_export_compare, "pkcs12-with-ca.ovpn", "pkcs12-with-ca.ovpntest");
+ 
++	_add_test_func_simple (test_pkcs11_import);
++	_add_test_func ("pkcs11-export", test_export_compare, "pkcs11.ovpn", "pkcs11.ovpntest");
++
+ 	_add_test_func_simple (test_non_utf8_import);
+ 
+ 	_add_test_func ("static-import-1", test_static_key_import, "static.ovpn", "static", "1");
+diff --git a/shared/nm-service-defines.h b/shared/nm-service-defines.h
+index 777645b..3978ab2 100644
+--- a/shared/nm-service-defines.h
++++ b/shared/nm-service-defines.h
+@@ -95,6 +95,9 @@
+ #define NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD       "http-proxy-password"
+ #define NM_OPENVPN_KEY_CHALLENGE_RESPONSE        "challenge-response"
+ 
++#define NM_OPENVPN_KEY_PKCS11_ID                 "pkcs11-id"
++#define NM_OPENVPN_KEY_PKCS11_PROVIDERS          "pkcs11-providers"
++
+ #define NM_OPENVPN_KEY_PASSWORD_FLAGS            "password-flags"
+ #define NM_OPENVPN_KEY_CERTPASS_FLAGS            "cert-pass-flags"
+ #define NM_OPENVPN_KEY_HTTP_PROXY_PASSWORD_FLAGS "http-proxy-password-flags"
+@@ -124,6 +127,7 @@
+ #define NM_OPENVPN_CONTYPE_PASSWORD_TLS "password-tls"
+ #define NM_OPENVPN_CONTYPE_STATIC_KEY   "static-key"
+ #define NM_OPENVPN_CONTYPE_TLS          "tls"
++#define NM_OPENVPN_CONTYPE_PKCS11       "pkcs11"
+ 
+ /* arguments of "--remote-cert-tls" */
+ #define NM_OPENVPN_REM_CERT_TLS_CLIENT "client"
+diff --git a/shared/utils.h b/shared/utils.h
+index 48109e1..91b73ce 100644
+--- a/shared/utils.h
++++ b/shared/utils.h
+@@ -63,6 +63,8 @@
+ #define NMV_OVPN_TAG_PING_EXIT              "ping-exit"
+ #define NMV_OVPN_TAG_PING_RESTART           "ping-restart"
+ #define NMV_OVPN_TAG_PKCS12                 "pkcs12"
++#define NMV_OVPN_TAG_PKCS11_ID              "pkcs11-id"
++#define NMV_OVPN_TAG_PKCS11_PROVIDERS       "pkcs11-providers"
+ #define NMV_OVPN_TAG_PORT                   "port"
+ #define NMV_OVPN_TAG_PROTO                  "proto"
+ #define NMV_OVPN_TAG_PUSH_PEER_INFO         "push-peer-info"
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index a85b004..28b98fe 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -199,6 +199,8 @@ static const ValidProperty valid_properties[] = {
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MIN_OR_HIGHEST,G_TYPE_BOOLEAN, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MAX,           G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_CHALLENGE_RESPONSE_FLAGS,  G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_ID,                 G_TYPE_STRING, 0, 0, FALSE },
++	{ NM_OPENVPN_KEY_PKCS11_PROVIDERS,          G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NULL,                                     G_TYPE_NONE, FALSE }
+ };
+ 
+@@ -241,7 +243,8 @@ validate_connection_type (const char *ctype)
+ 	return NM_IN_STRSET (ctype, NM_OPENVPN_CONTYPE_TLS,
+ 	                            NM_OPENVPN_CONTYPE_STATIC_KEY,
+ 	                            NM_OPENVPN_CONTYPE_PASSWORD,
+-	                            NM_OPENVPN_CONTYPE_PASSWORD_TLS);
++	                            NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++	                            NM_OPENVPN_CONTYPE_PKCS11);
+ }
+ 
+ static gboolean
+@@ -249,7 +252,8 @@ connection_type_is_tls_mode (const char *connection_type)
+ {
+ 	return NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
+ 	                                      NM_OPENVPN_CONTYPE_PASSWORD,
+-	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS);
++	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++	                                      NM_OPENVPN_CONTYPE_PKCS11);
+ }
+ 
+ /*****************************************************************************/
+@@ -414,9 +418,13 @@ args_add_vpn_certs (GPtrArray *args,
+ 	const char *ca;
+ 	const char *cert;
+ 	const char *key;
++	const char *pkcs11_id;
++	const char *pkcs11_providers;
+ 	gs_free char *ca_free = NULL;
+ 	gs_free char *cert_free = NULL;
+ 	gs_free char *key_free = NULL;
++	gs_free char *pkcs11_id_free = NULL;
++	gs_free char *pkcs11_providers_free = NULL;
+ 	gs_free char *ca_tmp = NULL;
+ 	gs_free char *cert_tmp = NULL;
+ 	gs_free char *key_tmp = NULL;
+@@ -428,10 +436,16 @@ args_add_vpn_certs (GPtrArray *args,
+ 	cert = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_CERT);
+ 	key  = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_KEY);
+ 
++	pkcs11_id        = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
++	pkcs11_providers = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++
+ 	ca   = nm_utils_str_utf8safe_unescape (ca,   &ca_free);
+ 	cert = nm_utils_str_utf8safe_unescape (cert, &cert_free);
+ 	key  = nm_utils_str_utf8safe_unescape (key,  &key_free);
+ 
++	pkcs11_id        = nm_utils_str_utf8safe_unescape (pkcs11_id,  &pkcs11_id_free);
++	pkcs11_providers = nm_utils_str_utf8safe_unescape (pkcs11_providers,  &pkcs11_providers_free);
++
+ 	if (nmovpn_arg_is_set (ca)) {
+ 		ca_tmp = access_file (ca, private_user, FALSE, error);
+ 		if (!ca_tmp)
+@@ -442,7 +456,12 @@ args_add_vpn_certs (GPtrArray *args,
+ 		}
+ 	}
+ 
+-	if (nmovpn_arg_is_set (cert)) {
++	if (nmovpn_arg_is_set (pkcs11_id)) {
++		args_add_strv (args, "--pkcs11-id", pkcs11_id);
++		if (nmovpn_arg_is_set (pkcs11_providers)) {
++			args_add_strv (args, "--pkcs11-providers", pkcs11_providers);
++		}
++	} else if (nmovpn_arg_is_set (cert)) {
+ 		cert_tmp = access_file (cert, private_user, FALSE, error);
+ 		if (!cert_tmp)
+ 			return FALSE;
+@@ -1039,7 +1058,7 @@ handle_auth (NMOpenvpnPluginIOData *io_data,
+ 			}
+ 		}
+ 		handled = TRUE;
+-	} else if (nm_streq (requested_auth, "Private Key")) {
++	} else if (nm_streq (requested_auth, "Private Key") || g_str_has_suffix (requested_auth, " token")) {
+ 		if (io_data->priv_key_pass) {
+ 			char *qpass, *buf;
+ 
+@@ -1053,6 +1072,10 @@ handle_auth (NMOpenvpnPluginIOData *io_data,
+ 			g_io_channel_write_chars (io_data->socket_channel, buf, strlen (buf), NULL, NULL);
+ 			g_io_channel_flush (io_data->socket_channel, NULL);
+ 			g_free (buf);
++		} else if (g_str_has_suffix (requested_auth, " token")) {
++			hints = g_new0 (const char *, 2);
++			hints[i++] = NM_OPENVPN_KEY_CERTPASS;
++			*out_message = _("Password.");
+ 		} else {
+ 			hints = g_new0 (const char *, 2);
+ 			hints[i++] = NM_OPENVPN_KEY_CERTPASS;
+@@ -2110,6 +2133,10 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
+ 			return FALSE;
+ 		/* Use user/path authentication */
+ 		args_add_strv (args, "--auth-user-pass");
++	} else if (nm_streq (connection_type, NM_OPENVPN_CONTYPE_PKCS11)) {
++		args_add_strv (args, "--client");
++		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
++			return FALSE;
+ 	} else {
+ 		g_set_error (error,
+ 		             NM_VPN_PLUGIN_ERROR,
+@@ -2182,7 +2209,8 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
+ 	*/
+ 	if (   NM_IN_STRSET (connection_type, NM_OPENVPN_CONTYPE_TLS,
+ 	                                      NM_OPENVPN_CONTYPE_PASSWORD,
+-	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS)
++	                                      NM_OPENVPN_CONTYPE_PASSWORD_TLS,
++	                                      NM_OPENVPN_CONTYPE_PKCS11)
+ 	    || nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_HTTP_PROXY_USERNAME)) {
+ 
+ 		priv->io_data = g_malloc0 (sizeof (NMOpenvpnPluginIOData));
+@@ -2239,6 +2267,14 @@ check_need_secrets (NMSettingVpn *s_vpn, gboolean *need_secrets)
+ 		key = nm_utils_str_utf8safe_unescape (key, &key_free);
+ 		if (is_encrypted (key) && !nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS))
+ 			*need_secrets = TRUE;
++	} else if (nm_streq (ctype, NM_OPENVPN_CONTYPE_PKCS11)) {
++		if (!nm_setting_vpn_get_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS)) {
++			*need_secrets = TRUE;
++			if (nm_setting_get_secret_flags (NM_SETTING (s_vpn), NM_OPENVPN_KEY_CERTPASS, &secret_flags, NULL)) {
++				if (secret_flags & NM_SETTING_SECRET_FLAG_NOT_REQUIRED)
++					*need_secrets = FALSE;
++			}
++		}
+ 	} else {
+ 		/* Static key doesn't need passwords */
+ 	}

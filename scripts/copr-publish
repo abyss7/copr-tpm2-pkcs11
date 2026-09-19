@@ -1,0 +1,45 @@
+#!/bin/bash
+# Build the patched SRPMs for the given Fedora releases and submit them to COPR.
+# COPR builds them in the current Fedora buildroot of each release.
+#
+# usage: scripts/copr-publish [-p owner/project] [-w] [<release>...]
+#   default project: $COPR_PROJECT or abyss/tpm2-pkcs11
+#   default releases: 43 44
+#   -w: wait for the builds to finish
+# Needs ~/.config/copr (https://copr.fedorainfracloud.org/api/).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+project=${COPR_PROJECT:-abyss/tpm2-pkcs11}
+wait=--nowait
+while getopts p:w o; do
+	case $o in
+	p) project=$OPTARG ;;
+	w) wait="" ;;
+	*) exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+rels=("$@")
+[ ${#rels[@]} -gt 0 ] || rels=(43 44)
+
+# copr-cli runs in the rootfs when not installed on the host
+copr() {
+	if command -v copr-cli > /dev/null; then
+		copr-cli "$@"
+	else
+		"$ROOT/scripts/enter.sh" "$ROOT/.cache/f${rels[0]}" bash -c \
+			'command -v copr-cli >/dev/null || dnf -y -q install copr-cli >/dev/null; cd /work && copr-cli "$@"' _ "$@"
+	fi
+}
+
+for rel in "${rels[@]}"; do
+	SRPM_ONLY=1 "$ROOT/scripts/rebuild" -r "$rel"
+done
+for rel in "${rels[@]}"; do
+	for srpm in "$ROOT/out/fc$rel/srpm/"*.src.rpm; do
+		echo "== $project fedora-$rel-x86_64: ${srpm##*/}"
+		# paths inside the rootfs are relative to /work
+		copr build $wait -r "fedora-$rel-x86_64" "$project" "${srpm#$ROOT/}"
+	done
+done

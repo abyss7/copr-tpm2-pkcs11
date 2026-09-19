@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Thu, 7 May 2026 17:08:10 +0200
+Subject: [PATCH] compilation fix
+
+---
+ properties/nm-openvpn-editor.c |  2 +-
+ shared/utils.c                 | 17 +++++++++--------
+ 2 files changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index 15fff19..4e56c1a 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -863,7 +863,7 @@ sk_default_filter (const GtkFileFilterInfo *filter_info, gpointer data)
+ 	unsigned char buffer[1024];
+ 	ssize_t bytes_read;
+ 	gboolean show = FALSE;
+-	char *p;
++	const char *p;
+ 	char *ext;
+ 
+ 	if (!filter_info->filename)
+diff --git a/shared/utils.c b/shared/utils.c
+index d688adc..9aeb594 100644
+--- a/shared/utils.c
++++ b/shared/utils.c
+@@ -223,6 +223,7 @@ nmovpn_remote_parse (const char *str,
+                      GError **error)
+ {
+ 	gs_free char *str_copy = NULL;
++	const char *tc;
+ 	char *t;
+ 	char *host = NULL;
+ 	char *port = NULL;
+@@ -238,20 +239,20 @@ nmovpn_remote_parse (const char *str,
+ 	}
+ 	g_return_val_if_fail (!error || !*error, 0);
+ 
+-	t = strchr (str, ' ');
+-	if (!t)
+-		t = strchr (str, ',');
+-	if (t) {
++	tc = strchr (str, ' ');
++	if (!tc)
++		tc = strchr (str, ',');
++	if (tc) {
+ 		g_set_error (error, NM_UTILS_ERROR, NM_UTILS_ERROR_UNKNOWN,
+-		             _("invalid delimiter character '%c'"), t[0]);
+-		idx_fail = t - str;
++		             _("invalid delimiter character '%c'"), tc[0]);
++		idx_fail = tc - str;
+ 		goto out_fail;
+ 	}
+ 
+-	if (!g_utf8_validate (str, -1, (const char **) &t)) {
++	if (!g_utf8_validate (str, -1, &tc)) {
+ 		g_set_error (error, NM_UTILS_ERROR, NM_UTILS_ERROR_UNKNOWN,
+ 		             _("invalid non-utf-8 character"));
+-		idx_fail = t - str;
++		idx_fail = tc - str;
+ 		goto out_fail;
+ 	}
+ 

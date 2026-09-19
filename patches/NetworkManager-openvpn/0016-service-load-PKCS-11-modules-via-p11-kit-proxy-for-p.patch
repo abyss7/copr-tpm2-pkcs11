@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Lezhankin <abyss.7@gmail.com>
+Date: Sat, 19 Sep 2026 13:56:20 +0300
+Subject: [PATCH] service: load PKCS#11 modules via p11-kit proxy for pkcs11-id
+
+openvpn only auto-loads p11-kit-proxy.so when built with p11-kit, which
+is not the case e.g. on Fedora. Without any provider --pkcs11-id cannot
+find the certificate. Always pass the p11-kit proxy module, its path is
+taken from p11-kit-1.pc at build time, so it is not user controllable.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ configure.ac             | 3 +++
+ src/nm-openvpn-service.c | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/configure.ac b/configure.ac
+index c00760a..c55b898 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -123,6 +123,9 @@ fi
+ PKG_CHECK_MODULES(LIBNM, libnm >= 1.52.2)
+ PKG_CHECK_MODULES(PKCS11_HELPER, libpkcs11-helper-1 >= 1.29)
+ PKG_CHECK_MODULES(P11KIT, p11-kit-1 >= 0.25)
++PKG_CHECK_VAR(P11KIT_PROXY_MODULE, p11-kit-1, proxy_module)
++AS_IF([test -z "$P11KIT_PROXY_MODULE"], [AC_MSG_ERROR([cannot determine p11-kit proxy module path])])
++AC_DEFINE_UNQUOTED(P11KIT_PROXY_MODULE, "$P11KIT_PROXY_MODULE", [Path of the p11-kit proxy PKCS#11 module])
+ 
+ NM_VPN_SERVICE_DIR=`$PKG_CONFIG --define-variable prefix='\${prefix}' --variable vpnservicedir libnm`
+ AC_SUBST(NM_VPN_SERVICE_DIR)
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index de06d5c..a8ac80a 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -452,6 +452,10 @@ args_add_vpn_certs (GPtrArray *args,
+ 	}
+ 
+ 	if (nmovpn_arg_is_set (pkcs11_id)) {
++		/* Fedora's openvpn is built without p11-kit and loads no PKCS#11
++		 * module by default. The p11-kit proxy exposes all modules
++		 * registered system-wide (OpenSC, ykcs11, softhsm, ...). */
++		args_add_strv (args, "--pkcs11-providers", P11KIT_PROXY_MODULE);
+ 		args_add_strv (args, "--pkcs11-id", pkcs11_id);
+ 	} else if (nmovpn_arg_is_set (cert)) {
+ 		cert_tmp = access_file (cert, private_user, FALSE, error);

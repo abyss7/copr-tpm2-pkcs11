@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Fri, 22 May 2026 18:08:00 +0200
+Subject: [PATCH] Fix TLS authentication tab not visible for PKCS#11
+ connections
+
+---
+ properties/nm-openvpn-editor.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index 8d197e0..cf1790e 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -2199,7 +2199,8 @@ advanced_dialog_new (GHashTable *hash, const char *contype)
+ 	if (NM_IN_STRSET (contype,
+ 	                  NM_OPENVPN_CONTYPE_TLS,
+ 	                  NM_OPENVPN_CONTYPE_PASSWORD_TLS,
+-	                  NM_OPENVPN_CONTYPE_PASSWORD)) {
++	                  NM_OPENVPN_CONTYPE_PASSWORD,
++	                  NM_OPENVPN_CONTYPE_PKCS11)) {
+ 		value = g_hash_table_lookup (hash, NM_OPENVPN_KEY_EXTRA_CERTS);
+ 		if (value && value[0]) {
+ 			file = g_file_new_for_path (value);

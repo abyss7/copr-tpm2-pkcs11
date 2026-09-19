@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Thu, 16 Jul 2026 11:27:17 +0200
+Subject: [PATCH] Apply 1 suggestion(s) to 1 file(s)
+
+Co-authored-by: Sergio Costas <sergio.costas@canonical.com>
+---
+ src/nm-openvpn-service.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index 85fb956..de06d5c 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -2129,6 +2129,7 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
+ 		args_add_strv (args, "--client");
+ 		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
+ 			return FALSE;
++		// --tls-exit is needed for PKCS#11 to avoid retrying over and over if a wrong PIN was provided
+ 		args_add_strv (args, "--tls-exit");
+ 	} else {
+ 		g_set_error (error,

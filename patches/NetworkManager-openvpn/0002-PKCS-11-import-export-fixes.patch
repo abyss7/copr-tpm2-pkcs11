@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Thu, 7 May 2026 17:08:10 +0200
+Subject: [PATCH] PKCS#11 import/export fixes
+
+---
+ properties/import-export.c            |  4 ++--
+ properties/nm-openvpn-dialog.ui       |  3 +++
+ properties/nm-openvpn-editor.c        | 30 ++++++++++++++++++++-------
+ properties/tests/conf/pkcs11.ovpn     |  2 +-
+ properties/tests/test-import-export.c |  2 +-
+ 5 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/properties/import-export.c b/properties/import-export.c
+index d996b74..af2c05a 100644
+--- a/properties/import-export.c
++++ b/properties/import-export.c
+@@ -1540,7 +1540,7 @@ do_import (const char *path, const char *contents, gsize contents_len, GError **
+ 				goto handle_line_error;
+ 			if (!args_params_check_arg_utf8 (params, 1, NULL, &line_error))
+ 				goto handle_line_error;
+-			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, params[1]);
++			setting_vpn_add_data_item_utf8safe (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, params[1]);
+ 			have_pkcs11 = TRUE;
+ 			continue;
+ 		}
+@@ -1550,7 +1550,7 @@ do_import (const char *path, const char *contents, gsize contents_len, GError **
+ 				goto handle_line_error;
+ 			if (!args_params_check_arg_utf8 (params, 1, NULL, &line_error))
+ 				goto handle_line_error;
+-			setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, params[1]);
++			setting_vpn_add_data_item_utf8safe (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, params[1]);
+ 			have_pkcs11 = TRUE;
+ 			continue;
+ 		}
+diff --git a/properties/nm-openvpn-dialog.ui b/properties/nm-openvpn-dialog.ui
+index 8778255..98a5a30 100644
+--- a/properties/nm-openvpn-dialog.ui
++++ b/properties/nm-openvpn-dialog.ui
+@@ -931,6 +931,9 @@ config: pkcs11-id</property>
+       <widget name="label12"/>
+       <widget name="label11"/>
+       <widget name="auth_label"/>
++      <widget name="label29"/>
++      <widget name="label30"/>
++      <widget name="label26"/>
+     </widgets>
+   </object>
+   <object class="GtkListStore" id="model3">
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index 1662715..15fff19 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -249,16 +249,22 @@ pkcs11_setup (GtkBuilder *builder,
+ 	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id"));
+ 	if (s_vpn) {
+ 		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
+-		if (value && *value)
+-			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++		if (value && *value) {
++			gs_free char *unescaped = NULL;
++
++			gtk_editable_set_text (GTK_EDITABLE (widget), nm_utils_str_utf8safe_unescape (value, &unescaped));
++		}
+ 	}
+ 	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
+ 
+ 	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_providers"));
+ 	if (s_vpn) {
+ 		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
+-		if (value && *value)
+-			gtk_editable_set_text (GTK_EDITABLE (widget), value);
++		if (value && *value) {
++			gs_free char *unescaped = NULL;
++
++			gtk_editable_set_text (GTK_EDITABLE (widget), nm_utils_str_utf8safe_unescape (value, &unescaped));
++		}
+ 	}
+ 	g_signal_connect (G_OBJECT (widget), "changed", G_CALLBACK (changed_cb), user_data);
+ 
+@@ -729,13 +735,21 @@ update_pkcs11 (GtkBuilder *builder, NMSettingVpn *s_vpn)
+ 
+ 	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id"));
+ 	str = gtk_editable_get_text (GTK_EDITABLE (widget));
+-	if (str && *str)
+-		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, str);
++	if (str && *str) {
++		gs_free char *escaped = NULL;
++
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID,
++		                              nm_utils_str_utf8safe_escape (str, 0, &escaped));
++	}
+ 
+ 	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_providers"));
+ 	str = gtk_editable_get_text (GTK_EDITABLE (widget));
+-	if (str && *str)
+-		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, str);
++	if (str && *str) {
++		gs_free char *escaped = NULL;
++
++		nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS,
++		                              nm_utils_str_utf8safe_escape (str, 0, &escaped));
++	}
+ 
+ 	widget = (GtkWidget *) gtk_builder_get_object (builder, "pkcs11_pin");
+ 	str = gtk_editable_get_text (GTK_EDITABLE (widget));
+diff --git a/properties/tests/conf/pkcs11.ovpn b/properties/tests/conf/pkcs11.ovpn
+index 627ab57..e59e37e 100644
+--- a/properties/tests/conf/pkcs11.ovpn
++++ b/properties/tests/conf/pkcs11.ovpn
+@@ -10,4 +10,4 @@ cipher AES-256-GCM
+ tls-client
+ remote-cert-tls server
+ pkcs11-providers /usr/lib/x86_64-linux-gnu/pkcs11/libtpm2_pkcs11.so
+-pkcs11-id Infineon/SLB9670/0000000000000000/mytoken/0123456789ABCDEF0123456789ABCDEF
++pkcs11-id 'Provider\x20\x28www\x2Eexample\x2Ecom\x29/MyKey\x20KEY5/12345678\x20PIV\x20\x2387654321/01'
+diff --git a/properties/tests/test-import-export.c b/properties/tests/test-import-export.c
+index d52dac0..c467526 100644
+--- a/properties/tests/test-import-export.c
++++ b/properties/tests/test-import-export.c
+@@ -673,7 +673,7 @@ test_pkcs11_import (void)
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_AUTH, NULL);
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_CA,   SRCDIR"/keys/mine-ca.crt");
+ 
+-	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, "Infineon/SLB9670/0000000000000000/mytoken/0123456789ABCDEF0123456789ABCDEF");
++	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, "Provider\\\\x20\\\\x28www\\\\x2Eexample\\\\x2Ecom\\\\x29/MyKey\\\\x20KEY5/12345678\\\\x20PIV\\\\x20\\\\x2387654321/01");
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, "/usr/lib/x86_64-linux-gnu/pkcs11/libtpm2_pkcs11.so");
+ 
+ 	_check_secret (s_vpn, NM_OPENVPN_KEY_PASSWORD, NULL);

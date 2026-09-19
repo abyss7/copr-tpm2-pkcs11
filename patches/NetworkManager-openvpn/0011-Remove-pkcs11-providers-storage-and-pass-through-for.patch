@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Fri, 22 May 2026 17:06:51 +0200
+Subject: [PATCH] Remove pkcs11-providers storage and pass-through for security
+
+---
+ Makefile.am                           |  5 +-
+ properties/import-export.c            | 19 ------
+ properties/nm-openvpn-editor.c        | 95 +++++++++++++--------------
+ properties/tests/conf/pkcs11.ovpn     |  1 -
+ properties/tests/test-import-export.c |  1 -
+ shared/nm-service-defines.h           |  1 -
+ shared/utils.h                        |  1 -
+ src/nm-openvpn-service.c              | 42 +-----------
+ 8 files changed, 50 insertions(+), 115 deletions(-)
+
+diff --git a/Makefile.am b/Makefile.am
+index 0aa9aee..2b9755d 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -71,14 +71,13 @@ src_libnm_utils_la_LIBADD = \
+ 
+ libexec_PROGRAMS += src/nm-openvpn-service
+ 
+-src_nm_openvpn_service_CPPFLAGS = $(src_cppflags) $(P11KIT_CFLAGS)
++src_nm_openvpn_service_CPPFLAGS = $(src_cppflags)
+ src_nm_openvpn_service_LDFLAGS = \
+ 	-Wl,--version-script="$(srcdir)/linker-script-binary.ver"
+ src_nm_openvpn_service_LDADD = \
+ 	src/libnm-utils.la \
+ 	$(GLIB_LIBS) \
+-	$(LIBNM_LIBS) \
+-	$(P11KIT_LIBS)
++	$(LIBNM_LIBS)
+ EXTRA_src_nm_openvpn_service_DEPENDENCIES = \
+ 	linker-script-binary.ver
+ 
+diff --git a/properties/import-export.c b/properties/import-export.c
+index af2c05a..767c2c3 100644
+--- a/properties/import-export.c
++++ b/properties/import-export.c
+@@ -1545,16 +1545,6 @@ do_import (const char *path, const char *contents, gsize contents_len, GError **
+ 			continue;
+ 		}
+ 
+-		if (NM_IN_STRSET (params[0], NMV_OVPN_TAG_PKCS11_PROVIDERS)) {
+-			if (!args_params_check_nargs_n (params, 1, &line_error))
+-				goto handle_line_error;
+-			if (!args_params_check_arg_utf8 (params, 1, NULL, &line_error))
+-				goto handle_line_error;
+-			setting_vpn_add_data_item_utf8safe (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, params[1]);
+-			have_pkcs11 = TRUE;
+-			continue;
+-		}
+-
+ 		if (params[0][0] == '<' && params[0][strlen (params[0]) - 1] == '>') {
+ 			gs_free char *token = g_strndup (&params[0][1], strlen (params[0]) - 2);
+ 			gs_free char *end_token = NULL;
+@@ -2164,15 +2154,6 @@ do_export_create (NMConnection *connection, const char *path, GError **error)
+ 			                 NMV_OVPN_TAG_PKCS11_ID,
+ 			                 nm_utils_str_utf8safe_unescape (value, &s_free));
+ 		}
+-
+-		value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
+-		if (nmovpn_arg_is_set (value)) {
+-			gs_free char *s_free = NULL;
+-
+-			args_write_line (f,
+-			                 NMV_OVPN_TAG_PKCS11_PROVIDERS,
+-			                 nm_utils_str_utf8safe_unescape (value, &s_free));
+-		}
+ 	}
+ 
+ 	args_write_line_setting_value_int (f, NMV_OVPN_TAG_RENEG_SEC, s_vpn, NM_OPENVPN_KEY_RENEG_SECONDS);
+diff --git a/properties/nm-openvpn-editor.c b/properties/nm-openvpn-editor.c
+index 6f5ab94..8d197e0 100644
+--- a/properties/nm-openvpn-editor.c
++++ b/properties/nm-openvpn-editor.c
+@@ -388,44 +388,65 @@ pkcs11_setup (GtkBuilder *builder,
+ 
+ 	/* Set current values if editing existing connection */
+ 	if (s_vpn) {
+-		const char *prov_value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
+ 		const char *id_value = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
+-		gs_free char *prov_unesc = NULL;
+-		gs_free char *id_unesc = NULL;
+-		const char *prov = NULL;
+-		const char *id = NULL;
+-
+-		if (prov_value && *prov_value) {
+-			prov = nm_utils_str_utf8safe_unescape (prov_value, &prov_unesc);
+-
+-			/* Try to select by active_id (path) — if not found, leave empty */
+-			if (gtk_combo_box_set_active_id (GTK_COMBO_BOX (provider_combo), prov)) {
+-				/* Populate IDs for this provider */
+-				pkcs11_populate_ids_for_provider (id_combo, prov);
+-			}
+-		}
+ 
+-		if (prov && gtk_combo_box_get_active (GTK_COMBO_BOX (provider_combo)) >= 0
+-		    && id_value && *id_value) {
+-			id = nm_utils_str_utf8safe_unescape (id_value, &id_unesc);
++		if (id_value && *id_value) {
++			gs_free char *id_unesc = NULL;
++			const char *id = nm_utils_str_utf8safe_unescape (id_value, &id_unesc);
++			GtkTreeModel *model;
++			GtkTreeIter iter;
++			gboolean id_found = FALSE;
++			int i;
++
++			/* Try each provider to find which one has this ID */
++			model = gtk_combo_box_get_model (GTK_COMBO_BOX (provider_combo));
++			if (gtk_tree_model_get_iter_first (model, &iter)) {
++				i = 0;
++				do {
++					const char *path;
++
++					gtk_combo_box_set_active (GTK_COMBO_BOX (provider_combo), i);
++					path = gtk_combo_box_get_active_id (GTK_COMBO_BOX (provider_combo));
++					if (!path || !*path) {
++						i++;
++						continue;
++					}
++					pkcs11_populate_ids_for_provider (id_combo, path);
++					if (gtk_combo_box_set_active_id (GTK_COMBO_BOX (id_combo), id)) {
++						id_found = TRUE;
++						break;
++					}
++					i++;
++				} while (gtk_tree_model_iter_next (model, &iter));
++			}
+ 
+-			/* Try to select by item ID (serialized pkcs11-id) */
+-			if (!gtk_combo_box_set_active_id (GTK_COMBO_BOX (id_combo), id)) {
+-				/* ID not found in enumerated list — device may be unplugged.
+-				 * Deserialize to show a friendly label. */
+-				gs_free char *display = NULL;
++			if (!id_found) {
++				/* ID not found in any provider — device may be unplugged */
++				gs_free char *label = NULL;
++				gs_free char *prov_label = NULL;
+ 				pkcs11h_certificate_id_t cert_id = NULL;
+ 
+ 				if (pkcs11h_initialize () == CKR_OK) {
+ 					if (pkcs11h_certificate_deserializeCertificateId (&cert_id, id) == CKR_OK
+ 					    && cert_id) {
+-						display = pkcs11_cert_label (cert_id);
++						label = pkcs11_cert_label (cert_id);
++						if (cert_id->token_id)
++							prov_label = g_strdup (cert_id->token_id->model);
+ 						pkcs11h_certificate_freeCertificateId (cert_id);
+ 					}
+ 					pkcs11h_terminate ();
+ 				}
+ 
+-				gtk_combo_box_text_append (id_combo, id, display ? display : id);
++				if (prov_label) {
++					gtk_combo_box_text_append (provider_combo, NULL, prov_label);
++					gtk_combo_box_set_active (GTK_COMBO_BOX (provider_combo),
++					                          gtk_tree_model_iter_n_children (
++					                              gtk_combo_box_get_model (GTK_COMBO_BOX (provider_combo)), NULL) - 1);
++				} else {
++					gtk_combo_box_set_active (GTK_COMBO_BOX (provider_combo), -1);
++				}
++
++				gtk_combo_box_text_append (id_combo, id, label ? label : id);
+ 				gtk_combo_box_set_active_id (GTK_COMBO_BOX (id_combo), id);
+ 			}
+ 		}
+@@ -719,18 +740,6 @@ validate_pkcs11 (GtkBuilder *builder, GError **error)
+ 		return FALSE;
+ 	}
+ 
+-	combo = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_provider_combo"));
+-	{
+-		gs_free char *text = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT (combo));
+-		if (!text || !*text) {
+-			g_set_error (error,
+-			             NMV_EDITOR_PLUGIN_ERROR,
+-			             NMV_EDITOR_PLUGIN_ERROR_INVALID_PROPERTY,
+-			             NM_OPENVPN_KEY_PKCS11_PROVIDERS);
+-			return FALSE;
+-		}
+-	}
+-
+ 	combo = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id_combo"));
+ 	{
+ 		gs_free char *text = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT (combo));
+@@ -915,18 +924,6 @@ update_pkcs11 (GtkBuilder *builder, NMSettingVpn *s_vpn)
+ 	                          NULL,
+ 	                          "pkcs11", "ca_cert", s_vpn);
+ 
+-	/* Provider combo */
+-	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_provider_combo"));
+-	{
+-		const char *id = gtk_combo_box_get_active_id (GTK_COMBO_BOX (widget));
+-		if (id && *id) {
+-			gs_free char *escaped = NULL;
+-
+-			nm_setting_vpn_add_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS,
+-			                              nm_utils_str_utf8safe_escape (id, 0, &escaped));
+-		}
+-	}
+-
+ 	/* ID combo */
+ 	widget = GTK_WIDGET (gtk_builder_get_object (builder, "pkcs11_id_combo"));
+ 	{
+diff --git a/properties/tests/conf/pkcs11.ovpn b/properties/tests/conf/pkcs11.ovpn
+index 566b381..0144023 100644
+--- a/properties/tests/conf/pkcs11.ovpn
++++ b/properties/tests/conf/pkcs11.ovpn
+@@ -9,5 +9,4 @@ persist-tun
+ cipher AES-256-GCM
+ tls-client
+ remote-cert-tls server
+-pkcs11-providers /usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-client.so
+ pkcs11-id 'Provider\x20\x28www\x2Eexample\x2Ecom\x29/MyKey\x20KEY5/12345678\x20PIV\x20\x2387654321/01'
+diff --git a/properties/tests/test-import-export.c b/properties/tests/test-import-export.c
+index aaf49c5..f7b4497 100644
+--- a/properties/tests/test-import-export.c
++++ b/properties/tests/test-import-export.c
+@@ -674,7 +674,6 @@ test_pkcs11_import (void)
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_CA,   SRCDIR"/keys/mine-ca.crt");
+ 
+ 	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID, "Provider\\\\x20\\\\x28www\\\\x2Eexample\\\\x2Ecom\\\\x29/MyKey\\\\x20KEY5/12345678\\\\x20PIV\\\\x20\\\\x2387654321/01");
+-	_check_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS, "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-client.so");
+ 
+ 	_check_secret (s_vpn, NM_OPENVPN_KEY_PASSWORD, NULL);
+ 	_check_secret (s_vpn, NM_OPENVPN_KEY_CERTPASS, NULL);
+diff --git a/shared/nm-service-defines.h b/shared/nm-service-defines.h
+index 3978ab2..a84116e 100644
+--- a/shared/nm-service-defines.h
++++ b/shared/nm-service-defines.h
+@@ -96,7 +96,6 @@
+ #define NM_OPENVPN_KEY_CHALLENGE_RESPONSE        "challenge-response"
+ 
+ #define NM_OPENVPN_KEY_PKCS11_ID                 "pkcs11-id"
+-#define NM_OPENVPN_KEY_PKCS11_PROVIDERS          "pkcs11-providers"
+ 
+ #define NM_OPENVPN_KEY_PASSWORD_FLAGS            "password-flags"
+ #define NM_OPENVPN_KEY_CERTPASS_FLAGS            "cert-pass-flags"
+diff --git a/shared/utils.h b/shared/utils.h
+index 91b73ce..a37e3e4 100644
+--- a/shared/utils.h
++++ b/shared/utils.h
+@@ -64,7 +64,6 @@
+ #define NMV_OVPN_TAG_PING_RESTART           "ping-restart"
+ #define NMV_OVPN_TAG_PKCS12                 "pkcs12"
+ #define NMV_OVPN_TAG_PKCS11_ID              "pkcs11-id"
+-#define NMV_OVPN_TAG_PKCS11_PROVIDERS       "pkcs11-providers"
+ #define NMV_OVPN_TAG_PORT                   "port"
+ #define NMV_OVPN_TAG_PROTO                  "proto"
+ #define NMV_OVPN_TAG_PUSH_PEER_INFO         "push-peer-info"
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index d4d298e..85fb956 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -38,8 +38,6 @@
+ #include <ctype.h>
+ #include <errno.h>
+ #include <locale.h>
+-
+-#include <p11-kit/p11-kit.h>
+ #include <pwd.h>
+ #include <grp.h>
+ #include <glib-unix.h>
+@@ -202,7 +200,6 @@ static const ValidProperty valid_properties[] = {
+ 	{ NM_OPENVPN_KEY_TLS_VERSION_MAX,           G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_CHALLENGE_RESPONSE_FLAGS,  G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NM_OPENVPN_KEY_PKCS11_ID,                 G_TYPE_STRING, 0, 0, FALSE },
+-	{ NM_OPENVPN_KEY_PKCS11_PROVIDERS,          G_TYPE_STRING, 0, 0, FALSE },
+ 	{ NULL,                                     G_TYPE_NONE, FALSE }
+ };
+ 
+@@ -411,31 +408,6 @@ args_add_file (GPtrArray *args,
+ 	return TRUE;
+ }
+ 
+-static gboolean
+-is_pkcs11_provider_registered (const char *provider_path)
+-{
+-	CK_FUNCTION_LIST **modules;
+-	gboolean found = FALSE;
+-	int i;
+-
+-	modules = p11_kit_modules_load_and_initialize (0);
+-	if (!modules)
+-		return FALSE;
+-
+-	for (i = 0; modules[i] != NULL; i++) {
+-		char *path = p11_kit_module_get_filename (modules[i]);
+-
+-		if (path && g_strcmp0 (path, provider_path) == 0)
+-			found = TRUE;
+-		free (path);
+-		if (found)
+-			break;
+-	}
+-
+-	p11_kit_modules_finalize_and_release (modules);
+-	return found;
+-}
+-
+ static gboolean
+ args_add_vpn_certs (GPtrArray *args,
+                     NMSettingVpn *s_vpn,
+@@ -446,12 +418,10 @@ args_add_vpn_certs (GPtrArray *args,
+ 	const char *cert;
+ 	const char *key;
+ 	const char *pkcs11_id;
+-	const char *pkcs11_providers;
+ 	gs_free char *ca_free = NULL;
+ 	gs_free char *cert_free = NULL;
+ 	gs_free char *key_free = NULL;
+ 	gs_free char *pkcs11_id_free = NULL;
+-	gs_free char *pkcs11_providers_free = NULL;
+ 	gs_free char *ca_tmp = NULL;
+ 	gs_free char *cert_tmp = NULL;
+ 	gs_free char *key_tmp = NULL;
+@@ -463,15 +433,13 @@ args_add_vpn_certs (GPtrArray *args,
+ 	cert = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_CERT);
+ 	key  = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_KEY);
+ 
+-	pkcs11_id        = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
+-	pkcs11_providers = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_PROVIDERS);
++	pkcs11_id = nm_setting_vpn_get_data_item (s_vpn, NM_OPENVPN_KEY_PKCS11_ID);
+ 
+ 	ca   = nm_utils_str_utf8safe_unescape (ca,   &ca_free);
+ 	cert = nm_utils_str_utf8safe_unescape (cert, &cert_free);
+ 	key  = nm_utils_str_utf8safe_unescape (key,  &key_free);
+ 
+-	pkcs11_id        = nm_utils_str_utf8safe_unescape (pkcs11_id,  &pkcs11_id_free);
+-	pkcs11_providers = nm_utils_str_utf8safe_unescape (pkcs11_providers,  &pkcs11_providers_free);
++	pkcs11_id = nm_utils_str_utf8safe_unescape (pkcs11_id, &pkcs11_id_free);
+ 
+ 	if (nmovpn_arg_is_set (ca)) {
+ 		ca_tmp = access_file (ca, private_user, FALSE, error);
+@@ -485,12 +453,6 @@ args_add_vpn_certs (GPtrArray *args,
+ 
+ 	if (nmovpn_arg_is_set (pkcs11_id)) {
+ 		args_add_strv (args, "--pkcs11-id", pkcs11_id);
+-		if (nmovpn_arg_is_set (pkcs11_providers)) {
+-			if (is_pkcs11_provider_registered (pkcs11_providers))
+-				args_add_strv (args, "--pkcs11-providers", pkcs11_providers);
+-			else
+-				_LOGW ("PKCS#11 provider '%s' is not registered in p11-kit, ignoring", pkcs11_providers);
+-		}
+ 	} else if (nmovpn_arg_is_set (cert)) {
+ 		cert_tmp = access_file (cert, private_user, FALSE, error);
+ 		if (!cert_tmp)

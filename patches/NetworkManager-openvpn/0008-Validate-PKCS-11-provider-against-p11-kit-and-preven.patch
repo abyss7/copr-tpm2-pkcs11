@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Piotr Filiciak <piotr@filiciak.pl>
+Date: Tue, 19 May 2026 13:45:07 +0200
+Subject: [PATCH] Validate PKCS#11 provider against p11-kit and prevent token
+ lockout
+
+---
+ Makefile.am              |  5 +++--
+ src/nm-openvpn-service.c | 33 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/Makefile.am b/Makefile.am
+index 2b9755d..0aa9aee 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -71,13 +71,14 @@ src_libnm_utils_la_LIBADD = \
+ 
+ libexec_PROGRAMS += src/nm-openvpn-service
+ 
+-src_nm_openvpn_service_CPPFLAGS = $(src_cppflags)
++src_nm_openvpn_service_CPPFLAGS = $(src_cppflags) $(P11KIT_CFLAGS)
+ src_nm_openvpn_service_LDFLAGS = \
+ 	-Wl,--version-script="$(srcdir)/linker-script-binary.ver"
+ src_nm_openvpn_service_LDADD = \
+ 	src/libnm-utils.la \
+ 	$(GLIB_LIBS) \
+-	$(LIBNM_LIBS)
++	$(LIBNM_LIBS) \
++	$(P11KIT_LIBS)
+ EXTRA_src_nm_openvpn_service_DEPENDENCIES = \
+ 	linker-script-binary.ver
+ 
+diff --git a/src/nm-openvpn-service.c b/src/nm-openvpn-service.c
+index 28b98fe..d4d298e 100644
+--- a/src/nm-openvpn-service.c
++++ b/src/nm-openvpn-service.c
+@@ -38,6 +38,8 @@
+ #include <ctype.h>
+ #include <errno.h>
+ #include <locale.h>
++
++#include <p11-kit/p11-kit.h>
+ #include <pwd.h>
+ #include <grp.h>
+ #include <glib-unix.h>
+@@ -409,6 +411,31 @@ args_add_file (GPtrArray *args,
+ 	return TRUE;
+ }
+ 
++static gboolean
++is_pkcs11_provider_registered (const char *provider_path)
++{
++	CK_FUNCTION_LIST **modules;
++	gboolean found = FALSE;
++	int i;
++
++	modules = p11_kit_modules_load_and_initialize (0);
++	if (!modules)
++		return FALSE;
++
++	for (i = 0; modules[i] != NULL; i++) {
++		char *path = p11_kit_module_get_filename (modules[i]);
++
++		if (path && g_strcmp0 (path, provider_path) == 0)
++			found = TRUE;
++		free (path);
++		if (found)
++			break;
++	}
++
++	p11_kit_modules_finalize_and_release (modules);
++	return found;
++}
++
+ static gboolean
+ args_add_vpn_certs (GPtrArray *args,
+                     NMSettingVpn *s_vpn,
+@@ -459,7 +486,10 @@ args_add_vpn_certs (GPtrArray *args,
+ 	if (nmovpn_arg_is_set (pkcs11_id)) {
+ 		args_add_strv (args, "--pkcs11-id", pkcs11_id);
+ 		if (nmovpn_arg_is_set (pkcs11_providers)) {
+-			args_add_strv (args, "--pkcs11-providers", pkcs11_providers);
++			if (is_pkcs11_provider_registered (pkcs11_providers))
++				args_add_strv (args, "--pkcs11-providers", pkcs11_providers);
++			else
++				_LOGW ("PKCS#11 provider '%s' is not registered in p11-kit, ignoring", pkcs11_providers);
+ 		}
+ 	} else if (nmovpn_arg_is_set (cert)) {
+ 		cert_tmp = access_file (cert, private_user, FALSE, error);
+@@ -2137,6 +2167,7 @@ nm_openvpn_start_openvpn_binary (NMOpenvpnPlugin *plugin,
+ 		args_add_strv (args, "--client");
+ 		if (!args_add_vpn_certs (args, s_vpn, private_user, error))
+ 			return FALSE;
++		args_add_strv (args, "--tls-exit");
+ 	} else {
+ 		g_set_error (error,
+ 		             NM_VPN_PLUGIN_ERROR,
