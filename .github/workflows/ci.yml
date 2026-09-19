@@ -22,7 +22,7 @@ jobs:
             git-core rpm-build dnf5-plugins createrepo_c python3 \
             openvpn softhsm opensc openssl cmake gcc-c++ make
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # the release suffix counts the commits that changed the patches
           fetch-depth: 0
@@ -33,7 +33,7 @@ jobs:
       - name: Build RPMs
         run: scripts/rebuild
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpms-fc${{ matrix.release }}
           path: out/fc${{ matrix.release }}/*.rpm
